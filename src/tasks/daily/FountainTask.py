@@ -105,11 +105,11 @@ class FountainTask(NTEOneTimeTask, BaseNTETask):
         self.operate_click(*self.DOMAIN_ENTRY_POS, after_sleep=1)
         self.operate_click(*self.DOMAIN_CONFIRM_POS, after_sleep=2)
         self.click_traval_button()
-        self.wait_in_team(time_out=30, settle_time=0.25)
+        self.wait_in_team(time_out=300, settle_time=0.25)
         self.sleep(0.5)
         box = self.box_of_screen(*self.PHONE_BOOTH_BOX, name="fountain_phone_booth")
         self.click_map_teleport(box)
-        self.wait_in_team(time_out=30, settle_time=0.25)
+        self.wait_in_team(time_out=600, settle_time=0.25)
         self.sleep(1)
 
     def run_to_fountain(self):

@@ -226,7 +226,7 @@ class AnomalyTask(NTEOneTimeTask, BaseCombatTask):
         btn = min(btns, key=lambda x: x.y)
         self.operate_click(btn)
         self.click_traval_button()
-        self.wait_in_team()
+        self.wait_in_team(time_out=300)
 
         stamina_units = stamina // self.TASK_COST
         if stamina_target is not None:

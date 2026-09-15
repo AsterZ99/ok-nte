@@ -190,7 +190,7 @@ class FurnitureTask(NTEOneTimeTask, BaseCombatTask):
             pre_action=lambda: self.operate_click(0.891, 0.951, after_sleep=1),
         )
         self.click_traval_button()
-        return self.wait_in_team(time_out=120, settle_time=1)
+        return self.wait_in_team(time_out=300, settle_time=1)
 
     def claim_furniture(self, furniture):
         if not self.teleport_to_furniture(furniture):

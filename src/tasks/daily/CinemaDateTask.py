@@ -73,7 +73,7 @@ class CinemaDateTask(NTEOneTimeTask, BaseNTETask):
         self.operate_click(0.862, 0.780)
         self.sleep(0.5)
         self.click_traval_button()
-        self.ensure_main(esc=False, time_out=60)
+        self.ensure_main(esc=False, time_out=300)
 
     def _go_to_front_desk(self):
         self.send_key_down("w")

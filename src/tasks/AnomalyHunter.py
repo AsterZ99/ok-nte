@@ -202,7 +202,7 @@ class AnomalyHunter(NTEOneTimeTask, BaseCombatTask):
         y = y_start + page_idx * self.HUNTER_TRAVEL_Y_STEP
         self.operate_click(self.HUNTER_TRAVEL_X, y)
         self.click_traval_button()
-        self.wait_in_team_and_world()
+        self.wait_in_team(time_out=300)
 
     def turn_to_next_hunter_page(self):
         self.log_info("异象追猎目标位于下一页，执行翻页")
