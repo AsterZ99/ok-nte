@@ -54,7 +54,7 @@ class CloudNTEInteraction(NTEInteraction):
     FAKE_ACTIVATE_INTERVAL = 3.0
     DEACTIVATE_AFTER_DISPATCH = False
     MIN_CLICK_DOWN_TIME = 0.08
-    CURSOR_SETTLE_SECONDS = 0.25
+    CURSOR_SETTLE_SECONDS = 0.4
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -179,6 +179,10 @@ class CloudNTEInteraction(NTEInteraction):
         lparam = (int(y) & 0xFFFF) << 16 | (int(x) & 0xFFFF)
         try:
             win32gui.PostMessage(hwnd, message, wparam, lparam)
+            logger.info(
+                f"cloud mouse: hwnd={hwnd} msg=0x{message:04X} wparam=0x{wparam:04X}"
+                f" pos=({int(x)},{int(y)}) lparam=0x{lparam & 0xFFFFFFFF:08X}"
+            )
             return True
         except Exception as error:
             logger.error(f"cloud input post failed hwnd={hwnd}: {error!r}")
