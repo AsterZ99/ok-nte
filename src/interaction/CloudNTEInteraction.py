@@ -1,115 +1,158 @@
-"""Interaction for the PC cloud NTE client.
+"""Interaction for the PC cloud NTE client (audit WP-2 backend).
 
-Phase 3/4 of the cloud NTE adaptation (see
-docs/zh-CN/development/云异环适配开发设计文档.md). The cloud client processes
-posted input only on its nested input surface
+The cloud client processes posted input only on its nested input surface
 (``WLCloudGameClient``/``WLCloudGame``) and only while it believes itself
-active, so this class:
+active. This class is the ok-script adapter; the input contracts live in
+``src/interaction/cloud_mouse.py``:
 
-- re-resolves the dynamically reparented child chain before every dispatch
-  (never caches HWNDs);
-- keeps a background thread sending a fake ``WM_ACTIVATE`` every few seconds;
-- posts keys with plain lparam (verified on a live client) instead of the
-  scan-code lparam used for the local game;
-- posts mouse clicks/moves directly to the child; the child client area maps
-  1:1 to the captured main-window content (same size and position).
+- every dispatch builds ONE immutable :class:`CloudInputSnapshot` and is
+  gated (:func:`validate_dispatch`) before anything is sent;
+- keyboard uses the live-client-verified recipe: plain lparam keys posted to
+  the leaf window behind a fake activation;
+- mouse uses the message backend only: posted MOVE/DOWN/UP to the verified
+  leaf window. No foreground switching, no real-cursor movement, no
+  ``mouse_event``/``SendInput`` — blocked or failing dispatches send nothing
+  (audit A-01/A-02, fail closed);
+- logically pressed buttons are tracked and force-released on destroy
+  (audit A-05).
 
-Known limits, verified on a live client:
+Known limits (honest failures, audit WP-2):
 
+- scroll is ``UNSUPPORTED`` until the real-client matrix proves it;
 - camera rotation via relative mouse movement does not reach the streamed
-  game; tasks that require it (AutoCombat aiming) are not supported in cloud
-  mode yet;
-- background scroll is unreliable (the prior art also falls back to physical
-  scrolling); messages are still posted, with a warning;
-- while fake activation is running the client captures the user's real mouse
-  in the background. The thread stops and the fake activation is released on
-  destroy.
+  game; combat tasks requiring it are unsupported in cloud mode;
+- the physical/foreground experimental backend was removed (see the audit
+  report, A-01); it lives only in git history.
 """
 
-import threading
 import time
 
-import win32api
 import win32con
 import win32gui
+import win32process
 from ok.util.logger import Logger
 
-from src.interaction.cloud_window import find_cloud_input_child
+from src.interaction.cloud_mouse import (
+    BUTTON_MESSAGES,
+    CloudDispatchReason,
+    CloudDispatchResult,
+    CloudDispatchStatus,
+    CloudInputSnapshot,
+    CloudMessagePointer,
+    validate_dispatch,
+)
+from src.interaction.cloud_window import CloudFrameHealth, find_cloud_input_child
 from src.interaction.NTEInteraction import NTEInteraction
 
 logger = Logger.get_logger(__name__)
 
 
 class CloudNTEInteraction(NTEInteraction):
-    """NTEInteraction variant targeting the cloud client's input surface.
+    """NTEInteraction variant targeting the cloud client's input surface."""
 
-    Input dispatch pattern: fake-activate the input surface, run the dispatch,
-    then immediately release the activation (``DEACTIVATE_AFTER_DISPATCH``).
-    The client only forwards input while it believes itself active; releasing
-    right after each dispatch stops it from capturing the user's real mouse
-    between dispatches (otherwise real mouse movement anywhere rotates the
-    in-game camera).
-    """
-
-    FAKE_ACTIVATE_INTERVAL = 3.0
-    DEACTIVATE_AFTER_DISPATCH = False
+    #: activation lease strategy (audit §7.4): activate per dispatch, release
+    #: queued after the input. The sustained background thread was removed:
+    #: the real-client matrix must prove it necessary before it returns.
+    DEACTIVATE_AFTER_DISPATCH = True
     MIN_CLICK_DOWN_TIME = 0.08
     CURSOR_SETTLE_SECONDS = 0.4
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._fake_activate_stop = threading.Event()
-        self._fake_activate_thread = None
-        if not self.DEACTIVATE_AFTER_DISPATCH:
-            # Sustained activation mode: keep the client always-active. The
-            # real mouse stays captured while this runs (legacy behavior).
-            self._fake_activate_thread = threading.Thread(
-                target=self._fake_activate_loop, name="cloud-fake-activate", daemon=True
-            )
-            self._fake_activate_thread.start()
+        self._pointer = CloudMessagePointer(self._post_message)
+        self._generation = 0
+        self._last_target = (0, 0)
+        self._frame_health = CloudFrameHealth.OK
+        self._frame_observed_at = time.time()
+        self._frame_size = (0, 0)
 
-    def _dispatch_with_activation(self, action):
-        """Fake-activate, run the dispatch, then release the activation."""
+    # -- lifecycle -------------------------------------------------------------
 
-        def run():
-            self.try_activate()
-            return action()
+    def record_frame_health(self, health, capture_size, observed_at=None):
+        """Receive the latest capture-health observation (audit A-06).
 
-        if self.DEACTIVATE_AFTER_DISPATCH:
+        Called by the task layer's periodic health check; the input gate uses
+        it to reject dispatches on unhealthy/stale frames.
+        """
+        self._frame_health = health
+        self._frame_size = (int(capture_size[0]), int(capture_size[1]))
+        self._frame_observed_at = time.time() if observed_at is None else observed_at
+
+    def on_destroy(self):
+        for leaf, message, wparam in self._pointer.cleanup():
             try:
-                result = run()
-            finally:
-                try:
-                    # Queued (PostMessage) so the client processes the input
-                    # messages first, then deactivates.
-                    self.release_fake_activation(post=True)
-                except Exception as error:
-                    logger.warning(f"release fake activation failed: {error!r}")
-            return result
-        return run()
+                if win32gui.IsWindow(leaf):
+                    win32gui.PostMessage(leaf, message, wparam, 0)
+            except Exception as error:
+                logger.warning(f"cloud button cleanup failed: {error!r}")
+        try:
+            self.release_fake_activation(post=False)
+        except Exception as error:
+            logger.warning(f"release cloud fake activation failed: {error!r}")
+        super().on_destroy()
 
-    # -- target resolution ---------------------------------------------------
+    # -- target resolution -----------------------------------------------------
 
-    def cloud_input_child(self):
-        """Current input surface hwnd, or 0 when the chain is absent."""
-        return find_cloud_input_child(self.hwnd_window.hwnd)
+    def _build_snapshot(self):
+        """Resolve one verified target snapshot, or None (fail closed).
+
+        No fallback to parent/middle windows (audit A-02): the leaf chain
+        must resolve completely and both windows must share one PID.
+        """
+        main = self.hwnd_window.hwnd if self.hwnd_window else 0
+        if not main or not win32gui.IsWindow(main):
+            return None
+        leaf = find_cloud_input_child(main)
+        if not leaf or not win32gui.IsWindow(leaf):
+            return None
+        try:
+            _tid, main_pid = win32process.GetWindowThreadProcessId(main)
+            _tid, leaf_pid = win32process.GetWindowThreadProcessId(leaf)
+        except Exception as error:
+            logger.warning(f"cloud pid check failed: {error!r}")
+            return None
+        if main_pid != leaf_pid or main_pid <= 0:
+            logger.warning("cloud target rejected: pid mismatch across the chain")
+            return None
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(leaf)
+        except Exception as error:
+            logger.warning(f"cloud leaf client rect failed: {error!r}")
+            return None
+        leaf_size = (right - left, bottom - top)
+        if leaf_size[0] <= 0 or leaf_size[1] <= 0:
+            return None
+        if (main, leaf) != self._last_target:
+            self._last_target = (main, leaf)
+            self._generation += 1
+        capture_w = int(getattr(self.capture, "width", 0) or 0)
+        capture_h = int(getattr(self.capture, "height", 0) or 0)
+        return CloudInputSnapshot(
+            main_hwnd=main,
+            leaf_hwnd=leaf,
+            process_id=main_pid,
+            capture_size=(capture_w, capture_h),
+            content_rect=(0, 0, capture_w, capture_h),
+            leaf_client_size=leaf_size,
+            frame_health=self._frame_health,
+            frame_observed_at=self._frame_observed_at,
+            generation=self._generation,
+        )
 
     @property
     def hwnd(self):
-        child = self.cloud_input_child()
-        if child:
-            return child
-        return super().hwnd
+        """The verified leaf input surface, or 0 — never a fallback (A-02)."""
+        return self._last_target[1] if self._last_target[1] else 0
 
-    # -- fake activation -------------------------------------------------------
+    # -- activation lease --------------------------------------------------------
 
-    def fake_activate(self):
-        child = self.cloud_input_child()
-        if child:
-            win32gui.SendMessage(child, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
-        return child
+    def fake_activate(self, leaf=None):
+        leaf = leaf or self.hwnd
+        if leaf:
+            win32gui.SendMessage(leaf, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
+        return leaf
 
-    def release_fake_activation(self, post=True):
+    def release_fake_activation(self, post=True, leaf=None):
         """Release the fake activation.
 
         ``post=True`` queues the WA_INACTIVE *after* already-posted input
@@ -117,35 +160,83 @@ class CloudNTEInteraction(NTEInteraction):
         synchronous SendMessage here would jump the queue and deactivate the
         client before it processes the queued clicks/keys, dropping them.
         """
-        child = self.cloud_input_child()
-        if not child:
+        leaf = leaf or self.hwnd
+        if not leaf:
             return
         if post:
-            win32gui.PostMessage(child, win32con.WM_ACTIVATE, win32con.WA_INACTIVE, 0)
+            win32gui.PostMessage(leaf, win32con.WM_ACTIVATE, win32con.WA_INACTIVE, 0)
         else:
-            win32gui.SendMessage(child, win32con.WM_ACTIVATE, win32con.WA_INACTIVE, 0)
-
-    def _fake_activate_loop(self):
-        while not self._fake_activate_stop.wait(self.FAKE_ACTIVATE_INTERVAL):
-            try:
-                self.fake_activate()
-            except Exception as error:
-                logger.warning(f"cloud fake activation failed: {error!r}")
+            win32gui.SendMessage(leaf, win32con.WM_ACTIVATE, win32con.WA_INACTIVE, 0)
 
     def try_activate(self):
-        # The sustained background activation covers activation needs; the
-        # Qt main window itself ignores WM_ACTIVATE for game input purposes.
         self.fake_activate()
 
-    def on_destroy(self):
-        self._fake_activate_stop.set()
-        try:
-            self.release_fake_activation(post=False)
-        except Exception as error:
-            logger.warning(f"release cloud fake activation failed: {error!r}")
-        super().on_destroy()
+    def _dispatch_with_activation(self, leaf, action):
+        """Activate, run the dispatch, then queue the release (audit §7.4)."""
 
-    # -- keyboard ---------------------------------------------------------------
+        def run():
+            self.fake_activate(leaf)
+            return action()
+
+        if self.DEACTIVATE_AFTER_DISPATCH:
+            try:
+                return run()
+            finally:
+                try:
+                    self.release_fake_activation(post=True, leaf=leaf)
+                except Exception as error:
+                    logger.warning(f"release fake activation failed: {error!r}")
+        return run()
+
+    # -- dispatch plumbing ---------------------------------------------------------
+
+    def _post_message(self, hwnd, message, wparam, lparam):
+        try:
+            win32gui.PostMessage(hwnd, message, wparam, lparam)
+            logger.info(
+                f"cloud input: hwnd={hwnd} msg=0x{message:04X} wparam=0x{wparam:04X} "
+                f"lparam=0x{lparam & 0xFFFFFFFF:08X}"
+            )
+            return True
+        except Exception as error:
+            logger.error(f"cloud input post failed hwnd={hwnd}: {error!r}")
+            return False
+
+    def _gate(self, capture_point=None):
+        """Resolve + gate one dispatch. Returns (result, snapshot)."""
+        snapshot = self._build_snapshot()
+        if snapshot is None:
+            result = CloudDispatchResult(
+                CloudDispatchStatus.BLOCKED,
+                CloudDispatchReason.NO_TARGET,
+                detail="cloud input chain missing or inconsistent",
+            )
+            logger.warning(f"cloud input blocked: {result.detail}")
+            return result, None
+        if capture_point is None:
+            return (
+                CloudDispatchResult(
+                    CloudDispatchStatus.PENDING, CloudDispatchReason.NONE
+                ),
+                snapshot,
+            )
+        expected_size = self._frame_size if self._frame_size[0] > 0 else None
+        result, leaf_point = validate_dispatch(
+            snapshot,
+            capture_point,
+            expected_capture_size=expected_size,
+        )
+        if result.blocked:
+            logger.warning(f"cloud input blocked: {result.reason.value} {result.detail}")
+        else:
+            result = CloudDispatchResult(
+                CloudDispatchStatus.PENDING,
+                CloudDispatchReason.NONE,
+                leaf_point=leaf_point,
+            )
+        return result, snapshot
+
+    # -- keyboard (verified recipe) ----------------------------------------------
 
     def make_lparam(self, vk_code, is_up=False):
         # Live-client verified: the child processes posted keys with plain
@@ -153,234 +244,102 @@ class CloudNTEInteraction(NTEInteraction):
         return 0xC0000000 if is_up else 0
 
     def send_key(self, key, down_time=0.01):
-        def dispatch():
-            # Zero-arg super() does not work inside a lambda ("super(): no
-            # arguments"), so the parent call must be explicit.
-            return NTEInteraction.send_key(self, key, down_time)
-
-        self._dispatch_with_activation(dispatch)
+        result, snapshot = self._gate()
+        if result.blocked or snapshot is None:
+            return
+        self._dispatch_with_activation(
+            snapshot.leaf_hwnd,
+            lambda: NTEInteraction.send_key(self, key, down_time),
+        )
 
     def send_key_down(self, key, activate=True):
-        def dispatch():
-            return NTEInteraction.send_key_down(self, key, activate=False)
-
-        self._dispatch_with_activation(dispatch)
+        result, snapshot = self._gate()
+        if result.blocked or snapshot is None:
+            return
+        self._dispatch_with_activation(
+            snapshot.leaf_hwnd,
+            lambda: NTEInteraction.send_key_down(self, key, activate=False),
+        )
 
     def send_key_up(self, key):
-        def dispatch():
-            return NTEInteraction.send_key_up(self, key)
+        result, snapshot = self._gate()
+        if result.blocked or snapshot is None:
+            return
+        self._dispatch_with_activation(
+            snapshot.leaf_hwnd, lambda: NTEInteraction.send_key_up(self, key)
+        )
 
-        self._dispatch_with_activation(dispatch)
-
-    # -- mouse -------------------------------------------------------------------
-
-    def _leaf_post(self, message, wparam, x, y):
-        hwnd = self.hwnd
-        lparam = (int(y) & 0xFFFF) << 16 | (int(x) & 0xFFFF)
-        try:
-            win32gui.PostMessage(hwnd, message, wparam, lparam)
-            logger.info(
-                f"cloud mouse: hwnd={hwnd} msg=0x{message:04X} wparam=0x{wparam:04X}"
-                f" pos=({int(x)},{int(y)}) lparam=0x{lparam & 0xFFFFFFFF:08X}"
-            )
-            return True
-        except Exception as error:
-            logger.error(f"cloud input post failed hwnd={hwnd}: {error!r}")
-            return False
-
-    def _scale_to_child(self, x, y):
-        """Map capture-frame coords to the child window's client coords."""
-        child = self.hwnd
-        try:
-            _left, _top, right, bottom = win32gui.GetClientRect(child)
-            client_w, client_h = right - _left, bottom - _top
-            frame_w, frame_h = self.capture.width, self.capture.height
-            if frame_w and frame_h and (client_w, client_h) != (frame_w, frame_h):
-                return round(x * client_w / frame_w), round(y * client_h / frame_h)
-        except Exception as error:
-            logger.warning(f"scale to child failed: {error!r}")
-        return int(x), int(y)
-
-    def _teleport_cursor(self, child, x, y):
-        """Save the real cursor once, then move it to the target.
-
-        A pending delayed restore is cancelled: consecutive clicks must keep
-        the cursor at their targets until the client has processed them.
-        """
-        timer = getattr(self, "_restore_timer", None)
-        if timer is not None:
-            timer.cancel()
-            self._restore_timer = None
-        if getattr(self, "_saved_cursor_pos", None) is None:
-            self._saved_cursor_pos = win32api.GetCursorPos()
-        screen = win32gui.ClientToScreen(child, (int(x), int(y)))
-        win32api.SetCursorPos(screen)
-
-    def _restore_cursor(self):
-        timer = getattr(self, "_restore_timer", None)
-        if timer is not None:
-            timer.cancel()
-            self._restore_timer = None
-        pos = getattr(self, "_saved_cursor_pos", None)
-        if pos is not None:
-            self._saved_cursor_pos = None
-            try:
-                win32api.SetCursorPos(pos)
-            except Exception as error:
-                logger.warning(f"restore cursor failed: {error!r}")
-
-    def _with_real_cursor(self, child, x, y, action, restore=True):
-        """Teleport the real cursor to the target client point, run, restore.
-
-        x/y must already be in the child window's client coords (see
-        _scale_to_child). The fake-activated client tracks the REAL OS cursor
-        position for its in-game cursor ("异环只能通过传递真实鼠标坐标实现
-        鼠标模拟"), so every mouse dispatch needs the cursor physically at
-        the target first.
-        """
-        try:
-            self._teleport_cursor(child, x, y)
-        except Exception as error:
-            logger.warning(f"teleport cursor failed: {error!r}")
-        try:
-            return action()
-        finally:
-            if restore:
-                self._restore_cursor()
+    # -- mouse (message backend) ---------------------------------------------------
 
     def move(self, x, y, down_btn=0):
-        x, y = self._scale_to_child(x, y)
-        self._leaf_post(win32con.WM_MOUSEMOVE, down_btn, x, y)
-        self.mouse_pos = (x, y)
-        return (int(y) & 0xFFFF) << 16 | (int(x) & 0xFFFF)
-
-    _BUTTON_FLAGS = {
-        "left": (0x0002, 0x0004),  # MOUSEEVENTF_LEFTDOWN / LEFTUP
-        "middle": (0x0020, 0x0040),  # MOUSEEVENTF_MIDDLEDOWN / MIDDLEUP
-        "right": (0x0008, 0x0010),  # MOUSEEVENTF_RIGHTDOWN / RIGHTUP
-    }
-
-    def _bring_cloud_to_front(self):
-        """Bring the cloud window to the foreground for a physical click.
-
-        Returns the previously active window hwnd, or None when no switch is
-        needed/possible.
-        """
-        main_hwnd = self.hwnd_window.hwnd
-        if not main_hwnd or not win32gui.IsWindow(main_hwnd):
-            return None
-        previous = win32gui.GetForegroundWindow()
-        if previous == main_hwnd:
-            return None
-        try:
-            win32gui.ShowWindow(main_hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(main_hwnd)
-        except Exception as error:
-            logger.warning(f"SetForegroundWindow failed: {error!r}")
-            return None
-        time.sleep(0.15)
-        if win32gui.GetForegroundWindow() != main_hwnd:
-            logger.warning("cloud window did not become the foreground window")
-            return None
-        return previous
-
-    def _restore_foreground(self, previous):
-        if previous and win32gui.IsWindow(previous):
-            try:
-                win32gui.SetForegroundWindow(previous)
-            except Exception as error:
-                logger.warning(f"restore foreground failed: {error!r}")
-
-    def _physical_button(self, child, x, y, down_flag, up_flag, down_time):
-        """Physical click: cursor teleport + real button events.
-
-        The cloud client forwards raw-input button events to the streamed
-        game; posted button messages never reach it. The cursor teleports to
-        the target and the click happens at OS level, so the game window must
-        be visible/uncovered at the target point.
-        """
-        screen = win32gui.ClientToScreen(child, (int(x), int(y)))
-        previous = self._bring_cloud_to_front()
-        try:
-            win32api.SetCursorPos(screen)
-            time.sleep(self.CURSOR_SETTLE_SECONDS)
-            win32api.mouse_event(down_flag, 0, 0, 0, 0)
-            time.sleep(down_time)
-            win32api.mouse_event(up_flag, 0, 0, 0, 0)
-            # Give the client time to process the button-up before switching
-            # the foreground away, otherwise the release can be dropped by
-            # its activity gate (press without release).
-            time.sleep(0.25)
-        finally:
-            self._restore_foreground(previous)
+        with self._input_lock:
+            result, snapshot = self._gate((x, y))
+            if result.blocked or snapshot is None:
+                return result
+            if not down_btn and self._pointer.buttons.is_pressed("left"):
+                # held-drag: every move must carry the button flag (audit A-04)
+                down_btn = win32con.MK_LBUTTON
+            move_result = self._pointer.move(snapshot, result.leaf_point, down_btn=down_btn)
+            self.mouse_pos = result.leaf_point
+            return move_result
 
     def click(self, x=-1, y=-1, move_back=False, name=None, down_time=0.01, move=True, key="left"):
+        if key not in BUTTON_MESSAGES:
+            logger.warning(f"cloud click refused: unknown button {key!r}")
+            return CloudDispatchResult(
+                CloudDispatchStatus.BLOCKED, CloudDispatchReason.UNSUPPORTED
+            )
         with self._input_lock:
-            self.try_activate()
             if x < 0 or y < 0:
                 x, y = round(self.capture.width * 0.5), round(self.capture.height * 0.5)
-            child = self.hwnd
-            x, y = self._scale_to_child(x, y)
-            # Streaming latency needs a more deliberate press than local play.
-            down_time = max(float(down_time), self.MIN_CLICK_DOWN_TIME)
-            down_flag, up_flag = self._BUTTON_FLAGS.get(key, self._BUTTON_FLAGS["left"])
+            result, snapshot = self._gate((x, y))
+            if result.blocked or snapshot is None:
+                return result
 
-            def dispatch():
-                self._physical_button(child, x, y, down_flag, up_flag, down_time)
+            def run():
+                if move:
+                    self._pointer.move(snapshot, result.leaf_point)
+                    time.sleep(self.CURSOR_SETTLE_SECONDS)
+                # Streaming latency needs a more deliberate press than local.
+                return self._pointer.click(
+                    snapshot,
+                    result.leaf_point,
+                    button=key,
+                    down_time=max(float(down_time), self.MIN_CLICK_DOWN_TIME),
+                )
 
-            self._dispatch_with_activation(dispatch)
+            return self._dispatch_with_activation(snapshot.leaf_hwnd, run)
 
     def right_click(self, x=-1, y=-1, move_back=False, name=None):
-        self.click(x, y, move_back=move_back, name=name, key="right")
+        return self.click(x, y, move_back=move_back, name=name, key="right")
 
     def mouse_down(self, x=-1, y=-1, name=None, key="left"):
         with self._input_lock:
-            self.try_activate()
-            if x < 0 or y < 0:
-                x, y = round(self.capture.width * 0.5), round(self.capture.height * 0.5)
-            child = self.hwnd
-            x, y = self._scale_to_child(x, y)
-            down_flag, _up_flag = self._BUTTON_FLAGS.get(
-                key, self._BUTTON_FLAGS["left"]
-            )
-
-            def dispatch():
-                screen = win32gui.ClientToScreen(child, (int(x), int(y)))
-                self._bring_cloud_to_front()
-                win32api.SetCursorPos(screen)
-                time.sleep(self.CURSOR_SETTLE_SECONDS)
-                win32api.mouse_event(down_flag, 0, 0, 0, 0)
-                self.mouse_pos = (x, y)
-
-            self._dispatch_with_activation(dispatch)
+            result, snapshot = self._gate((x, y))
+            if result.blocked or snapshot is None:
+                return result
+            press_result = self._pointer.press(snapshot, result.leaf_point, button=key)
+            if press_result.ok:
+                self.mouse_pos = result.leaf_point
+            return press_result
 
     def mouse_up(self, key="left"):
         with self._input_lock:
-            _down_flag, up_flag = self._BUTTON_FLAGS.get(key, self._BUTTON_FLAGS["left"])
-            win32api.mouse_event(up_flag, 0, 0, 0, 0)
+            result, snapshot = self._gate()
+            if result.blocked or snapshot is None:
+                return result
+            return self._pointer.release(snapshot, button=key)
 
     def scroll(self, x, y, scroll_amount):
-        # Live-client status: background wheel is unconfirmed; the prior art
-        # falls back to physical scrolling. Physical wheel at the cursor.
-        with self._input_lock:
-            self.try_activate()
-            child = self.hwnd
-            x, y = self._scale_to_child(x, y)
-
-            def dispatch():
-                screen = win32gui.ClientToScreen(child, (int(x), int(y)))
-                previous = self._bring_cloud_to_front()
-                try:
-                    win32api.SetCursorPos(screen)
-                    time.sleep(self.CURSOR_SETTLE_SECONDS)
-                    delta = win32con.WHEEL_DELTA if scroll_amount > 0 else -win32con.WHEEL_DELTA
-                    for _ in range(abs(scroll_amount)):
-                        win32api.mouse_event(0x0800, 0, 0, delta, 0)  # MOUSEEVENTF_WHEEL
-                        time.sleep(0.05)
-                finally:
-                    self._restore_foreground(previous)
-
-            self._dispatch_with_activation(dispatch)
+        # Not proven on a real client (the prior art also fails here); honest
+        # failure until the capability matrix says otherwise (audit WP-2).
+        logger.warning(
+            "cloud mode: scroll is not supported yet (pending real-client "
+            "matrix); request ignored"
+        )
+        return CloudDispatchResult(
+            CloudDispatchStatus.BLOCKED, CloudDispatchReason.UNSUPPORTED
+        )
 
     def move_mouse_relative(self, dx, dy):
         # Camera rotation does not reach the streamed game via injected or
@@ -389,4 +348,7 @@ class CloudNTEInteraction(NTEInteraction):
         logger.warning(
             "cloud mode: relative mouse movement (camera rotation) is not "
             "supported and was ignored"
+        )
+        return CloudDispatchResult(
+            CloudDispatchStatus.BLOCKED, CloudDispatchReason.UNSUPPORTED
         )

@@ -221,43 +221,243 @@ class TestKeyboardDispatch(unittest.TestCase):
 
     def _make_interaction(self):
         import threading
+        import time
 
-        from src.interaction.CloudNTEInteraction import CloudNTEInteraction
+        from src.interaction.cloud_mouse import CloudMessagePointer
 
         interaction = CloudNTEInteraction.__new__(CloudNTEInteraction)
         interaction._input_lock = threading.RLock()
-        interaction._fake_activate_stop = threading.Event()
+        interaction._pointer = CloudMessagePointer(Mock(return_value=True))
+        interaction._generation = 0
+        interaction._last_target = (0, 0)
+        interaction._frame_health = CloudFrameHealth.OK
+        interaction._frame_observed_at = time.time()
+        interaction._frame_size = (0, 0)
         interaction.hwnd_window = Mock()
-        interaction.hwnd_window.hwnd = 123
+        interaction.hwnd_window.hwnd = 100
+        interaction.capture = Mock()
+        interaction.capture.width = 1920
+        interaction.capture.height = 1080
         return interaction
+
+    def _gate_patches(self):
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        stack.enter_context(
+            patch("src.interaction.CloudNTEInteraction.find_cloud_input_child", return_value=300)
+        )
+        stack.enter_context(patch("win32gui.IsWindow", return_value=True))
+        stack.enter_context(patch("win32process.GetWindowThreadProcessId", return_value=(1, 42)))
+        stack.enter_context(patch("win32gui.GetClientRect", return_value=(0, 0, 1920, 1080)))
+        return stack
 
     def test_send_key_dispatches_through_fake_activation(self):
         interaction = self._make_interaction()
 
         with (
-            patch("src.interaction.CloudNTEInteraction.find_cloud_input_child", return_value=456),
+            self._gate_patches(),
             patch("src.interaction.CloudNTEInteraction.NTEInteraction") as parent,
             patch("win32gui.SendMessage") as send_message,
+            patch("win32gui.PostMessage") as post_message,
         ):
             interaction.send_key("e")
 
             parent.send_key.assert_called_once_with(interaction, "e", 0.01)
-            # sustained activation mode: activate only, no queued release
+            # per-dispatch lease: sync activate, queued release
             self.assertEqual(send_message.call_count, 1)
+            self.assertEqual(post_message.call_count, 1)
 
     def test_send_key_down_and_up_dispatch(self):
         interaction = self._make_interaction()
 
         with (
-            patch("src.interaction.CloudNTEInteraction.find_cloud_input_child", return_value=456),
+            self._gate_patches(),
             patch("src.interaction.CloudNTEInteraction.NTEInteraction") as parent,
             patch("win32gui.SendMessage"),
+            patch("win32gui.PostMessage"),
         ):
             interaction.send_key_down("w")
             interaction.send_key_up("w")
 
         parent.send_key_down.assert_called_once_with(interaction, "w", activate=False)
         parent.send_key_up.assert_called_once_with(interaction, "w")
+
+    def test_send_key_blocked_when_leaf_chain_missing(self):
+        interaction = self._make_interaction()
+
+        with (
+            patch(
+                "src.interaction.CloudNTEInteraction.find_cloud_input_child",
+                return_value=0,
+            ),
+            patch("win32gui.IsWindow", return_value=True),
+            patch("src.interaction.CloudNTEInteraction.NTEInteraction") as parent,
+            patch("win32gui.SendMessage") as send_message,
+        ):
+            interaction.send_key("e")
+
+        # fail closed: no parent dispatch, no activation, no fallback target
+        parent.send_key.assert_not_called()
+        send_message.assert_not_called()
+
+
+class TestMouseMessageBackend(TestKeyboardDispatch):
+    """Audit A-01/A-02/A-04/A-10: background message backend behavior."""
+
+    def _make_interaction(self):
+        interaction = TestKeyboardDispatch._make_interaction(self)
+        return interaction
+
+    def test_module_has_no_physical_input_api(self):
+        import src.interaction.CloudNTEInteraction as module
+
+        self.assertFalse(hasattr(module, "win32api"), "physical input API imported")
+
+    def test_click_posts_message_sequence_to_leaf(self):
+        import win32con
+
+        interaction = self._make_interaction()
+        poster = interaction._pointer._poster
+
+        with (
+            self._gate_patches(),
+            patch("win32gui.SendMessage"),
+            patch("win32gui.PostMessage"),
+            patch("time.sleep"),
+        ):
+            result = interaction.click(960, 540)
+
+        self.assertTrue(result.ok)
+        posted = [call.args for call in poster.call_args_list]
+        self.assertEqual(len(posted), 3)
+        self.assertEqual(posted[0][0], 300)
+        self.assertEqual(posted[0][1], win32con.WM_MOUSEMOVE)
+        self.assertEqual(posted[1][1], win32con.WM_LBUTTONDOWN)
+        self.assertEqual(posted[1][2], win32con.MK_LBUTTON)
+        self.assertEqual(posted[2][1], win32con.WM_LBUTTONUP)
+        self.assertEqual(posted[1][3], posted[2][3])  # same lparam
+
+    def test_click_blocked_outside_content_rect_sends_nothing(self):
+        interaction = self._make_interaction()
+        poster = interaction._pointer._poster
+
+        with (
+            self._gate_patches(),
+            patch("win32gui.SendMessage") as send_message,
+            patch("win32gui.PostMessage") as post_message,
+        ):
+            result = interaction.click(5000, 5000)
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reason.value, "out_of_bounds")
+        poster.assert_not_called()
+        send_message.assert_not_called()
+        post_message.assert_not_called()
+
+    def test_click_blocked_when_leaf_chain_missing(self):
+        interaction = self._make_interaction()
+        poster = interaction._pointer._poster
+
+        with (
+            patch(
+                "src.interaction.CloudNTEInteraction.find_cloud_input_child",
+                return_value=0,
+            ),
+            patch("win32gui.IsWindow", return_value=True),
+            patch("win32gui.SendMessage") as send_message,
+        ):
+            result = interaction.click(100, 100)
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reason.value, "no_target")
+        poster.assert_not_called()
+        send_message.assert_not_called()
+
+    def test_pid_mismatch_blocks_dispatch(self):
+        interaction = self._make_interaction()
+        poster = interaction._pointer._poster
+
+        with (
+            self._gate_patches(),
+            patch("win32process.GetWindowThreadProcessId", side_effect=[(1, 42), (1, 43)]),
+            patch("win32gui.SendMessage") as send_message,
+        ):
+            result = interaction.click(100, 100)
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reason.value, "no_target")
+        poster.assert_not_called()
+        send_message.assert_not_called()
+
+    def test_unhealthy_frame_blocks_dispatch(self):
+        interaction = self._make_interaction()
+        interaction._frame_health = CloudFrameHealth.BLACK
+        poster = interaction._pointer._poster
+
+        with (
+            self._gate_patches(),
+            patch("win32gui.SendMessage") as send_message,
+        ):
+            result = interaction.click(100, 100)
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reason.value, "unhealthy_frame")
+        poster.assert_not_called()
+        send_message.assert_not_called()
+
+    def test_mouse_down_up_are_paired_on_leaf(self):
+        import win32con
+
+        interaction = self._make_interaction()
+        poster = interaction._pointer._poster
+
+        with (
+            self._gate_patches(),
+            patch("win32gui.SendMessage"),
+            patch("win32gui.PostMessage"),
+        ):
+            down = interaction.mouse_down(100, 200)
+            self.assertTrue(down.ok)
+            self.assertTrue(interaction._pointer.buttons.is_pressed("left"))
+            up = interaction.mouse_up()
+            self.assertTrue(up.ok)
+
+        self.assertEqual(poster.call_args_list[0].args[1], win32con.WM_LBUTTONDOWN)
+        self.assertEqual(poster.call_args_list[1].args[1], win32con.WM_LBUTTONUP)
+        self.assertFalse(interaction._pointer.buttons.is_pressed("left"))
+
+    def test_on_destroy_releases_pressed_buttons(self):
+        import win32con
+
+        interaction = self._make_interaction()
+        interaction._pointer.buttons.press("left", 300)
+        interaction._last_target = (100, 300)
+
+        with (
+            patch("win32gui.IsWindow", return_value=True),
+            patch("win32gui.PostMessage") as post_message,
+            patch("win32gui.SendMessage"),
+            patch(
+                "src.interaction.NTEInteraction.NTEInteraction.on_destroy"
+            ) as parent_destroy,
+        ):
+            interaction.on_destroy()
+
+        released = [call.args for call in post_message.call_args_list]
+        self.assertIn((300, win32con.WM_LBUTTONUP, 0, 0), released)
+        self.assertEqual(interaction._pointer.buttons.pressed_buttons(), {})
+        parent_destroy.assert_called_once()
+
+    def test_scroll_is_unsupported(self):
+        interaction = self._make_interaction()
+
+        with patch("src.interaction.CloudNTEInteraction.logger") as log_mock:
+            result = interaction.scroll(100, 100, 3)
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reason.value, "unsupported")
+        log_mock.warning.assert_called()
 
 
 if __name__ == "__main__":
