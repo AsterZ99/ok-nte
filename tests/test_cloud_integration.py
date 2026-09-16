@@ -35,22 +35,75 @@ class _LauncherTaskBase(unittest.TestCase):
         task._wait_for_game_and_capture = Mock()
         task._update_launcher_path_from_game = Mock()
         task.capture_config = DynamicConfig()
+        task.config = {"Run Target": "auto"}
+        task._resolve_cloud_now = Mock(return_value=None)
+        task._find_process = Mock(return_value=None)
         return task
+
+
+class TestRunTargetConfig(unittest.TestCase):
+    def test_invalid_run_target_falls_back_to_auto(self):
+        task = _LauncherTaskBase()._make_task()
+        task.config = {"Run Target": "banana"}
+
+        self.assertEqual(task._get_run_target(), "auto")
+        task.log_warning.assert_called_once()
+
+    def test_run_target_values_are_respected(self):
+        task = _LauncherTaskBase()._make_task()
+        for value in ("auto", "local", "cloud"):
+            task.config = {"Run Target": value}
+            self.assertEqual(task._get_run_target(), value)
 
 
 class TestCloudAutoDetection(_LauncherTaskBase):
     def test_run_uses_cloud_capture_when_cloud_client_is_running(self):
         task = self._make_task()
-        task._find_process = Mock(return_value={"pid": 43532, "name": CLOUD_EXE})
+        cloud_target = Mock()
+        task._resolve_cloud_now = Mock(return_value=cloud_target)
 
         task.run()
 
         task._wait_for_cloud_and_capture.assert_called_once_with()
         task._wait_for_game_and_capture.assert_not_called()
 
+    def test_run_fails_closed_when_cloud_and_local_both_running(self):
+        from ok import TaskDisabledException
+
+        task = self._make_task()
+        task._resolve_cloud_now = Mock(return_value=Mock())
+        task._find_process = Mock(return_value={"pid": 1, "name": "HTGame.exe"})
+
+        with self.assertRaisesRegex(TaskDisabledException, "Ambiguous run target"):
+            task.run()
+        task._wait_for_cloud_and_capture.assert_not_called()
+
+    def test_run_target_local_skips_cloud_detection(self):
+        from ok import TaskDisabledException
+
+        task = self._make_task()
+        task.config = {"Run Target": "local"}
+        task._find_process = Mock(return_value=None)
+        # never touch the real registry/launcher in tests
+        task._get_launcher_path = Mock(return_value=None)
+
+        with self.assertRaisesRegex(TaskDisabledException, "Launcher path not found"):
+            task.run()
+
+        task._resolve_cloud_now.assert_not_called()
+
+    def test_run_target_cloud_does_not_check_local_process(self):
+        task = self._make_task()
+        task.config = {"Run Target": "cloud"}
+
+        task.run()
+
+        task._wait_for_cloud_and_capture.assert_called_once_with()
+        task._find_process.assert_not_called()
+
     def test_run_falls_back_to_local_flow_without_cloud_client(self):
         task = self._make_task()
-        task._find_process = Mock(side_effect=[None, {"pid": 1, "name": "HTGame.exe"}])
+        task._find_process = Mock(return_value={"pid": 1, "name": "HTGame.exe"})
         task._update_launcher_path = Mock()
         task._wait_for_process = Mock(return_value=True)
 
@@ -58,6 +111,49 @@ class TestCloudAutoDetection(_LauncherTaskBase):
 
         task._wait_for_cloud_and_capture.assert_not_called()
         task._wait_for_game_and_capture.assert_called_once_with(time_out=120, settle_window=False)
+
+    def test_resolve_cloud_now_raises_on_ambiguity(self):
+        from ok import TaskDisabledException
+
+        task = self._make_task()
+        del task._resolve_cloud_now  # use the real method, not the stub
+
+        with (
+            patch("src.interaction.cloud_window.collect_windows", return_value=[]),
+            patch(
+                "src.interaction.cloud_window.resolve_cloud_target",
+                return_value=Mock(status="ambiguous"),
+            ),
+        ):
+            with self.assertRaisesRegex(TaskDisabledException, "Multiple cloud game windows"):
+                task._resolve_cloud_now()
+
+    def test_resolve_cloud_now_returns_target_when_resolved(self):
+        task = self._make_task()
+        del task._resolve_cloud_now
+        target = Mock()
+
+        with (
+            patch("src.interaction.cloud_window.collect_windows", return_value=[]),
+            patch(
+                "src.interaction.cloud_window.resolve_cloud_target",
+                return_value=Mock(status="resolved", target=target),
+            ),
+        ):
+            self.assertIs(task._resolve_cloud_now(), target)
+
+    def test_resolve_cloud_now_returns_none_when_not_running(self):
+        task = self._make_task()
+        del task._resolve_cloud_now
+
+        with (
+            patch("src.interaction.cloud_window.collect_windows", return_value=[]),
+            patch(
+                "src.interaction.cloud_window.resolve_cloud_target",
+                return_value=Mock(status="none"),
+            ),
+        ):
+            self.assertIsNone(task._resolve_cloud_now())
 
     def test_find_process_window_filters_cloud_windows_by_exact_title(self):
         task = self._make_task()
@@ -98,9 +194,11 @@ class TestCaptureHealth(_LauncherTaskBase):
         task._health_frame = frame
         return task
 
-    def _patch_og(self):
+    def _patch_og(self, selected_exe=CLOUD_EXE, interaction=None):
         device_manager = Mock()
         device_manager.hwnd_window.hwnd = 12586332
+        device_manager.config = {"selected_exe": selected_exe}
+        device_manager.interaction = interaction
         og_mock = Mock()
         og_mock.device_manager = device_manager
         return patch("src.tasks.BaseNTETask.og", og_mock), patch(
@@ -177,6 +275,32 @@ class TestCaptureHealth(_LauncherTaskBase):
         self.assertEqual(first, CloudFrameHealth.OK)
         self.assertIsNone(second)
         task.scene.set_game_capture_ready.assert_called_once_with(True)
+
+    def test_health_check_skipped_for_local_target(self):
+        frame = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+        task = self._make_health_task(frame)
+        og_patch, iswindow_patch = self._patch_og(selected_exe="HTGame.exe")
+
+        with og_patch, iswindow_patch:
+            health = task.update_capture_health(frame=frame)
+
+        # audit A-06: the cloud health gate must not change local behavior
+        self.assertIsNone(health)
+        task.scene.set_game_capture_ready.assert_not_called()
+
+    def test_health_pushes_observation_to_cloud_interaction(self):
+        frame = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+        task = self._make_health_task(frame)
+        interaction = Mock()
+        og_patch, iswindow_patch = self._patch_og(interaction=interaction)
+
+        with og_patch, iswindow_patch:
+            health = task.update_capture_health(frame=frame)
+
+        self.assertEqual(health, CloudFrameHealth.OK)
+        interaction.record_frame_health.assert_called_once_with(
+            CloudFrameHealth.OK, (1920, 1080)
+        )
 
 
 class TestOneTimeTaskHealthGate(unittest.TestCase):

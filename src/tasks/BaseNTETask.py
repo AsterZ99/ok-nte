@@ -16,7 +16,7 @@ from ok import (
     safe_get,
 )
 
-from src import text_black_color
+from src import CLOUD_EXE, text_black_color
 from src.interaction.cloud_window import CloudFrameHealth, assess_frame_health
 from src.Labels import Labels
 from src.scene.NTEScene import NTEScene
@@ -962,10 +962,23 @@ class BaseNTETask(
         return "zh" in self.get_app_locale()
 
     def update_capture_health(self, frame=None, throttle_seconds=5.0):
-        """周期性截图健康检查 (Phase 4): 失败时置 game_capture_ready=False。
+        """周期性截图健康检查 (Phase 4 / audit A-06): 失败时置 game_capture_ready=False。
 
         有节流; 健康判定来自 src/interaction/cloud_window.assess_frame_health。
+        只对云运行目标生效 (selected_exe == CLOUD_EXE), 不改变本地异环行为;
+        观测结果推送给 CloudNTEInteraction 作为每次输入派发的门禁状态。
         """
+        device_manager = og.device_manager
+        selected = None
+        if hasattr(device_manager, "config"):
+            selected = device_manager.config.get("selected_exe")
+        if isinstance(selected, (list, tuple, set)):
+            is_cloud = CLOUD_EXE in selected
+        else:
+            is_cloud = selected == CLOUD_EXE
+        if not is_cloud:
+            return None
+
         now = time.time()
         last = getattr(self, "_capture_health_checked_at", 0.0)
         if now - last < throttle_seconds:
@@ -974,7 +987,6 @@ class BaseNTETask(
 
         import win32gui
 
-        device_manager = og.device_manager
         hwnd_window = getattr(device_manager, "hwnd_window", None)
         hwnd = getattr(hwnd_window, "hwnd", 0) if hwnd_window else 0
         hwnd_valid = bool(hwnd and win32gui.IsWindow(hwnd))
@@ -998,6 +1010,9 @@ class BaseNTETask(
                 f"({width}x{height}, content_ratio={content_ratio:.4f}); "
                 f"game_capture_ready -> {ready}"
             )
+        interaction = getattr(device_manager, "interaction", None)
+        if interaction is not None and hasattr(interaction, "record_frame_health"):
+            interaction.record_frame_health(health, (width, height))
         return health
 
     def open_f1_domain_page(self):

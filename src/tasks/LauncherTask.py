@@ -72,14 +72,46 @@ class DynamicConfig(dict):
 
 class LauncherTask(BaseNTETask):
     CONF_PATH = "Launcher Path"
+    CONF_RUN_TARGET = "Run Target"
+    RUN_TARGET_CHOICES = ("auto", "local", "cloud")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.name = "Start Game"
-        self.default_config.update({self.CONF_PATH: ""})
+        self.default_config.update({self.CONF_PATH: "", self.CONF_RUN_TARGET: "auto"})
         self.enable_after_start = True  # auto run after start
         self.visible = False  # False to hide from the UI
         self.capture_config = DynamicConfig()
+
+    def _get_run_target(self):
+        """Explicit run target (audit A-08): auto | local | cloud.
+
+        ``auto`` refuses to pick between a simultaneously running local game
+        and cloud client — the user must choose explicitly.
+        """
+        value = str(self.config.get(self.CONF_RUN_TARGET, "auto") or "auto").strip().lower()
+        if value not in self.RUN_TARGET_CHOICES:
+            self.log_warning(
+                f"invalid run target {value!r}; falling back to 'auto'"
+            )
+            value = "auto"
+        return value
+
+    def _resolve_cloud_now(self):
+        """Resolve the cloud target with the shared fail-closed resolver (A-07)."""
+        from src.interaction import cloud_window as cw
+
+        records = cw.collect_windows()
+        resolution = cw.resolve_cloud_target(records)
+        if resolution.status == "resolved":
+            return resolution.target
+        if resolution.status == "ambiguous":
+            # fail closed: never pick between multiple valid targets
+            raise TaskDisabledException(
+                "Multiple cloud game windows match the target identity; "
+                "close the extra clients or select the target manually"
+            )
+        return None
 
     def run(self):
         self.scene.set_game_capture_ready(False)
@@ -89,15 +121,38 @@ class LauncherTask(BaseNTETask):
         if not self._check_admin():
             return
 
-        cloud_proc = self._find_process(CLOUD_EXE)
-        self.log_info(f"Cloud game process check: {self._format_process(cloud_proc)}")
-        if cloud_proc:
+        run_target = self._get_run_target()
+        cloud_target = None
+        game_proc = None
+        if run_target != "local":
+            # audit A-07: use the shared fail-closed resolver, never a
+            # first-match process scan
+            cloud_target = self._resolve_cloud_now()
+            self.log_info(f"Cloud target resolution: {self._describe_cloud(cloud_target)}")
+        if run_target != "cloud":
+            game_proc = self._find_process(GAME_EXE)
+            self.log_info(f"Game process check: {self._format_process(game_proc)}")
+
+        if run_target == "auto" and cloud_target is not None and game_proc:
+            # audit A-08: never silently prefer one of two running targets
+            self.log_error(
+                "Both the cloud client and the local game are running; "
+                "set 'Run Target' to local or cloud to choose explicitly"
+            )
+            raise TaskDisabledException(
+                "Ambiguous run target: both local game and cloud client are "
+                "running. Set Run Target to local or cloud"
+            )
+
+        if cloud_target is not None and run_target in ("auto", "cloud"):
             self.log_info("Cloud client is running; preparing cloud capture")
             self._wait_for_cloud_and_capture()
             return
+        if run_target == "cloud":
+            self.log_info("Cloud target not resolved yet; waiting for the cloud client")
+            self._wait_for_cloud_and_capture()
+            return
 
-        game_proc = self._find_process(GAME_EXE)
-        self.log_info(f"Game process check: {self._format_process(game_proc)}")
         if game_proc:
             self.log_info("Game is already running; preparing game capture")
             self._update_launcher_path_from_game(game_proc.get("exe"))
@@ -144,6 +199,12 @@ class LauncherTask(BaseNTETask):
             raise TaskDisabledException("Timed out waiting for launcher to minimize")
         self._wait_for_game_and_capture()
 
+    @staticmethod
+    def _describe_cloud(target):
+        if target is None:
+            return "not running"
+        return f"hwnd={target.hwnd} class={target.class_name!r} title={target.title!r}"
+
     def _capture_game(self):
         self.log_info(
             f"Switching capture to game window: {self.capture_config.GAME_CAPTURE_CONFIG}"
@@ -173,7 +234,20 @@ class LauncherTask(BaseNTETask):
         if not self._wait_for_process(CLOUD_EXE, time_out=time_out, settle_window=False):
             self.log_error("Timed out waiting for cloud game window")
             raise TaskDisabledException("Timed out waiting for cloud game window")
-        self.log_info("Cloud game window found; switching capture to cloud")
+        deadline = time.time() + time_out
+        target = None
+        while time.time() < deadline:
+            # re-resolve with the shared resolver; raises on ambiguity (A-07)
+            target = self._resolve_cloud_now()
+            if target is not None:
+                break
+            self.sleep(1)
+        if target is None:
+            self.log_error("Timed out waiting for the cloud main window")
+            raise TaskDisabledException(
+                "Timed out waiting for the cloud main window (云·异环)"
+            )
+        self.log_info(f"Cloud game window resolved: {self._describe_cloud(target)}")
         self._capture_cloud()
         self._wait_for_capture_connection()
         resolution_error = og.app.start_controller.check_resolution()
