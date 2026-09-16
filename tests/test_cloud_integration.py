@@ -238,14 +238,12 @@ class TestKeyboardDispatch(unittest.TestCase):
             patch("src.interaction.CloudNTEInteraction.find_cloud_input_child", return_value=456),
             patch("src.interaction.CloudNTEInteraction.NTEInteraction") as parent,
             patch("win32gui.SendMessage") as send_message,
-            patch("win32gui.PostMessage") as post_message,
         ):
             interaction.send_key("e")
 
             parent.send_key.assert_called_once_with(interaction, "e", 0.01)
-            # fake activate (sync) + queued release (async, after the input)
+            # sustained activation mode: activate only, no queued release
             self.assertEqual(send_message.call_count, 1)
-            self.assertEqual(post_message.call_count, 1)
 
     def test_send_key_down_and_up_dispatch(self):
         interaction = self._make_interaction()

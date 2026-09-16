@@ -52,7 +52,7 @@ class CloudNTEInteraction(NTEInteraction):
     """
 
     FAKE_ACTIVATE_INTERVAL = 3.0
-    DEACTIVATE_AFTER_DISPATCH = True
+    DEACTIVATE_AFTER_DISPATCH = False
     MIN_CLICK_DOWN_TIME = 0.08
 
     def __init__(self, *args, **kwargs):
@@ -277,13 +277,12 @@ class CloudNTEInteraction(NTEInteraction):
 
             def dispatch():
                 if move:
-                    # The client updates its in-game cursor from a stream of
-                    # mouse events; a single teleport jump often does not
-                    # settle it, so pulse the move message a few times.
+                    # The streamed game tracks the real cursor with network
+                    # latency: teleport + post the move, then wait for the
+                    # position to propagate to the cloud before clicking.
                     self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
-                    time.sleep(0.03)
+                    time.sleep(self.CURSOR_SETTLE_SECONDS)
                     self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
-                    time.sleep(0.05)
                 self._leaf_post(btn_down, btn_mk, x, y)
                 time.sleep(down_time)
                 self._leaf_post(btn_up, 0, x, y)
