@@ -41,17 +41,49 @@ logger = Logger.get_logger(__name__)
 
 
 class CloudNTEInteraction(NTEInteraction):
-    """NTEInteraction variant targeting the cloud client's input surface."""
+    """NTEInteraction variant targeting the cloud client's input surface.
+
+    Input dispatch pattern: fake-activate the input surface, run the dispatch,
+    then immediately release the activation (``DEACTIVATE_AFTER_DISPATCH``).
+    The client only forwards input while it believes itself active; releasing
+    right after each dispatch stops it from capturing the user's real mouse
+    between dispatches (otherwise real mouse movement anywhere rotates the
+    in-game camera).
+    """
 
     FAKE_ACTIVATE_INTERVAL = 3.0
+    DEACTIVATE_AFTER_DISPATCH = True
+    MIN_CLICK_DOWN_TIME = 0.05
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._fake_activate_stop = threading.Event()
-        self._fake_activate_thread = threading.Thread(
-            target=self._fake_activate_loop, name="cloud-fake-activate", daemon=True
-        )
-        self._fake_activate_thread.start()
+        self._fake_activate_thread = None
+        if not self.DEACTIVATE_AFTER_DISPATCH:
+            # Sustained activation mode: keep the client always-active. The
+            # real mouse stays captured while this runs (legacy behavior).
+            self._fake_activate_thread = threading.Thread(
+                target=self._fake_activate_loop, name="cloud-fake-activate", daemon=True
+            )
+            self._fake_activate_thread.start()
+
+    def _dispatch_with_activation(self, action):
+        """Fake-activate, run the dispatch, then release the activation."""
+
+        def run():
+            self.try_activate()
+            return action()
+
+        if self.DEACTIVATE_AFTER_DISPATCH:
+            try:
+                result = run()
+            finally:
+                try:
+                    self.release_fake_activation()
+                except Exception as error:
+                    logger.warning(f"release fake activation failed: {error!r}")
+            return result
+        return run()
 
     # -- target resolution ---------------------------------------------------
 
@@ -105,6 +137,15 @@ class CloudNTEInteraction(NTEInteraction):
         # Live-client verified: the child processes posted keys with plain
         # lparam. Scan-code lparam is not required (Noki-compatible recipe).
         return 0xC0000000 if is_up else 0
+
+    def send_key(self, key, down_time=0.01):
+        self._dispatch_with_activation(lambda: super().send_key(key, down_time))
+
+    def send_key_down(self, key, activate=True):
+        self._dispatch_with_activation(lambda: super().send_key_down(key, activate=False))
+
+    def send_key_up(self, key):
+        self._dispatch_with_activation(lambda: super().send_key_up(key))
 
     # -- mouse -------------------------------------------------------------------
 
@@ -174,9 +215,12 @@ class CloudNTEInteraction(NTEInteraction):
             self._leaf_post(win32con.WM_MOUSEMOVE, down_btn, x, y)
             self.mouse_pos = (x, y)
 
-        # No restore: drag/swipe sequences need the cursor to stay at the
-        # moved position between steps; mouse_up releases it.
-        self._with_real_cursor(child, x, y, dispatch, restore=False)
+        def run():
+            # No restore: drag/swipe sequences need the cursor to stay at the
+            # moved position between steps; mouse_up releases it.
+            self._with_real_cursor(child, x, y, dispatch, restore=False)
+
+        self._dispatch_with_activation(run)
         return (int(y) & 0xFFFF) << 16 | (int(x) & 0xFFFF)
 
     def click(self, x=-1, y=-1, move_back=False, name=None, down_time=0.01, move=True, key="left"):
@@ -186,6 +230,8 @@ class CloudNTEInteraction(NTEInteraction):
                 x, y = round(self.capture.width * 0.5), round(self.capture.height * 0.5)
             child = self.hwnd
             x, y = self._scale_to_child(x, y)
+            # Streaming latency needs a more deliberate press than local play.
+            down_time = max(float(down_time), self.MIN_CLICK_DOWN_TIME)
             if key == "left":
                 btn_down, btn_mk, btn_up = (
                     win32con.WM_LBUTTONDOWN,
@@ -207,13 +253,21 @@ class CloudNTEInteraction(NTEInteraction):
 
             def dispatch():
                 if move:
+                    # The client updates its in-game cursor from a stream of
+                    # mouse events; a single teleport jump often does not
+                    # settle it, so pulse the move message a few times.
                     self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
-                    time.sleep(down_time)
+                    time.sleep(0.03)
+                    self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
+                    time.sleep(0.05)
                 self._leaf_post(btn_down, btn_mk, x, y)
                 time.sleep(down_time)
                 self._leaf_post(btn_up, 0, x, y)
 
-            self._with_real_cursor(child, x, y, dispatch)
+            def run():
+                self._with_real_cursor(child, x, y, dispatch)
+
+            self._dispatch_with_activation(run)
 
     def right_click(self, x=-1, y=-1, move_back=False, name=None):
         self.click(x, y, move_back=move_back, name=name, key="right")
@@ -236,8 +290,11 @@ class CloudNTEInteraction(NTEInteraction):
                 self._leaf_post(action, btn, x, y)
                 self.mouse_pos = (x, y)
 
-            # Held press: the cursor stays at the target until mouse_up.
-            self._with_real_cursor(child, x, y, dispatch, restore=False)
+            def run():
+                # Held press: the cursor stays at the target until mouse_up.
+                self._with_real_cursor(child, x, y, dispatch, restore=False)
+
+            self._dispatch_with_activation(run)
 
     def mouse_up(self, key="left"):
         with self._input_lock:
@@ -247,6 +304,8 @@ class CloudNTEInteraction(NTEInteraction):
             x, y = self._scale_to_child(*getattr(self, "mouse_pos", (0, 0)))
             self._leaf_post(action, 0, x, y)
             self._restore_cursor()
+            if self.DEACTIVATE_AFTER_DISPATCH:
+                self.release_fake_activation()
 
     def scroll(self, x, y, scroll_amount):
         # Live-client status: background wheel is unconfirmed; the prior art
@@ -255,13 +314,22 @@ class CloudNTEInteraction(NTEInteraction):
             self.try_activate()
             child = self.hwnd
             wparam = win32api.MAKELONG(0, win32con.WHEEL_DELTA * scroll_amount)
-            if x > 0 and y > 0:
-                x, y = self._scale_to_child(x, y)
-                self._with_real_cursor(
-                    child, x, y, lambda: self._leaf_post(win32con.WM_MOUSEWHEEL, wparam, x, y)
-                )
-            else:
-                self._leaf_post(win32con.WM_MOUSEWHEEL, wparam, 0, 0)
+
+            def run():
+                if x > 0 and y > 0:
+                    scaled_x, scaled_y = self._scale_to_child(x, y)
+                    self._with_real_cursor(
+                        child,
+                        scaled_x,
+                        scaled_y,
+                        lambda: self._leaf_post(
+                            win32con.WM_MOUSEWHEEL, wparam, scaled_x, scaled_y
+                        ),
+                    )
+                else:
+                    self._leaf_post(win32con.WM_MOUSEWHEEL, wparam, 0, 0)
+
+            self._dispatch_with_activation(run)
 
     def move_mouse_relative(self, dx, dy):
         # Camera rotation does not reach the streamed game via injected or
