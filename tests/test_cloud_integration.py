@@ -215,5 +215,50 @@ class TestOneTimeTaskHealthGate(unittest.TestCase):
         self.assertEqual(calls, ["health"])
 
 
+class TestKeyboardDispatch(unittest.TestCase):
+    """Regression: zero-arg super() inside a lambda raises 'super(): no
+    arguments', which silently broke every cloud keyboard dispatch."""
+
+    def _make_interaction(self):
+        import threading
+
+        from src.interaction.CloudNTEInteraction import CloudNTEInteraction
+
+        interaction = CloudNTEInteraction.__new__(CloudNTEInteraction)
+        interaction._input_lock = threading.RLock()
+        interaction._fake_activate_stop = threading.Event()
+        interaction.hwnd_window = Mock()
+        interaction.hwnd_window.hwnd = 123
+        return interaction
+
+    def test_send_key_dispatches_through_fake_activation(self):
+        interaction = self._make_interaction()
+
+        with (
+            patch("src.interaction.CloudNTEInteraction.find_cloud_input_child", return_value=456),
+            patch("src.interaction.CloudNTEInteraction.NTEInteraction") as parent,
+            patch("win32gui.SendMessage") as send_message,
+        ):
+            interaction.send_key("e")
+
+            parent.send_key.assert_called_once_with(interaction, "e", 0.01)
+            # fake activate + release around the dispatch
+            self.assertEqual(send_message.call_count, 2)
+
+    def test_send_key_down_and_up_dispatch(self):
+        interaction = self._make_interaction()
+
+        with (
+            patch("src.interaction.CloudNTEInteraction.find_cloud_input_child", return_value=456),
+            patch("src.interaction.CloudNTEInteraction.NTEInteraction") as parent,
+            patch("win32gui.SendMessage"),
+        ):
+            interaction.send_key_down("w")
+            interaction.send_key_up("w")
+
+        parent.send_key_down.assert_called_once_with(interaction, "w", activate=False)
+        parent.send_key_up.assert_called_once_with(interaction, "w")
+
+
 if __name__ == "__main__":
     unittest.main()

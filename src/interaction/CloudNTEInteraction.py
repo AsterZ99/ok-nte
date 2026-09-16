@@ -139,13 +139,24 @@ class CloudNTEInteraction(NTEInteraction):
         return 0xC0000000 if is_up else 0
 
     def send_key(self, key, down_time=0.01):
-        self._dispatch_with_activation(lambda: super().send_key(key, down_time))
+        def dispatch():
+            # Zero-arg super() does not work inside a lambda ("super(): no
+            # arguments"), so the parent call must be explicit.
+            return NTEInteraction.send_key(self, key, down_time)
+
+        self._dispatch_with_activation(dispatch)
 
     def send_key_down(self, key, activate=True):
-        self._dispatch_with_activation(lambda: super().send_key_down(key, activate=False))
+        def dispatch():
+            return NTEInteraction.send_key_down(self, key, activate=False)
+
+        self._dispatch_with_activation(dispatch)
 
     def send_key_up(self, key):
-        self._dispatch_with_activation(lambda: super().send_key_up(key))
+        def dispatch():
+            return NTEInteraction.send_key_up(self, key)
+
+        self._dispatch_with_activation(dispatch)
 
     # -- mouse -------------------------------------------------------------------
 
