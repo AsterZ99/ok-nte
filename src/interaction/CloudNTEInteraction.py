@@ -282,23 +282,11 @@ class CloudNTEInteraction(NTEInteraction):
             # Streaming latency needs a more deliberate press than local play.
             down_time = max(float(down_time), self.MIN_CLICK_DOWN_TIME)
             if key == "left":
-                btn_down, btn_mk, btn_up = (
-                    win32con.WM_LBUTTONDOWN,
-                    win32con.MK_LBUTTON,
-                    win32con.WM_LBUTTONUP,
-                )
+                btn_down, btn_up = 0x0002, 0x0004  # MOUSEEVENTF_LEFTDOWN/UP
             elif key == "middle":
-                btn_down, btn_mk, btn_up = (
-                    win32con.WM_MBUTTONDOWN,
-                    win32con.MK_MBUTTON,
-                    win32con.WM_MBUTTONUP,
-                )
+                btn_down, btn_up = 0x0020, 0x0040  # MOUSEEVENTF_MIDDLEDOWN/UP
             else:
-                btn_down, btn_mk, btn_up = (
-                    win32con.WM_RBUTTONDOWN,
-                    win32con.MK_RBUTTON,
-                    win32con.WM_RBUTTONUP,
-                )
+                btn_down, btn_up = 0x0008, 0x0010  # MOUSEEVENTF_RIGHTDOWN/UP
 
             def dispatch():
                 if move:
@@ -308,9 +296,12 @@ class CloudNTEInteraction(NTEInteraction):
                     self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
                     time.sleep(self.CURSOR_SETTLE_SECONDS)
                     self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
-                self._leaf_post(btn_down, btn_mk, x, y)
+                # Button events must be physical-level (mouse_event): the
+                # client forwards raw input only; posted button messages are
+                # ignored by its game-input path.
+                win32api.mouse_event(btn_down, 0, 0, 0, 0)
                 time.sleep(down_time)
-                self._leaf_post(btn_up, 0, x, y)
+                win32api.mouse_event(btn_up, 0, 0, 0, 0)
 
             def run():
                 self._with_real_cursor(child, x, y, dispatch)
@@ -328,15 +319,10 @@ class CloudNTEInteraction(NTEInteraction):
                 x, y = round(self.capture.width * 0.5), round(self.capture.height * 0.5)
             child = self.hwnd
             x, y = self._scale_to_child(x, y)
-            btn = {"left": win32con.MK_LBUTTON, "middle": win32con.MK_MBUTTON}.get(
-                key, win32con.MK_RBUTTON
-            )
-            action = {"left": win32con.WM_LBUTTONDOWN, "middle": win32con.WM_MBUTTONDOWN}.get(
-                key, win32con.WM_RBUTTONDOWN
-            )
+            btn_down = {"left": 0x0002, "middle": 0x0020}.get(key, 0x0008)
 
             def dispatch():
-                self._leaf_post(action, btn, x, y)
+                win32api.mouse_event(btn_down, 0, 0, 0, 0)
                 self.mouse_pos = (x, y)
 
             def run():
@@ -347,11 +333,11 @@ class CloudNTEInteraction(NTEInteraction):
 
     def mouse_up(self, key="left"):
         with self._input_lock:
-            action = {"left": win32con.WM_LBUTTONUP, "middle": win32con.WM_MBUTTONUP}.get(
-                key, win32con.WM_RBUTTONUP
-            )
+            btn_up = {"left": 0x0004, "middle": 0x0040}.get(key, 0x0010)
             x, y = self._scale_to_child(*getattr(self, "mouse_pos", (0, 0)))
-            self._leaf_post(action, 0, x, y)
+
+            def dispatch():
+                win32api.mouse_event(btn_up, 0, 0, 0, 0)
             self._restore_cursor_later()
             if self.DEACTIVATE_AFTER_DISPATCH:
                 # Queued after the button-up message.
