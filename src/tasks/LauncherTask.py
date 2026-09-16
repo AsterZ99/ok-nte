@@ -9,8 +9,10 @@ import win32process
 from ok import TaskDisabledException, og
 from ok.util.process import execute, is_admin
 
-from src import GAME_EXE, LAUNCHER_EXE
+from src import CLOUD_EXE, GAME_EXE, LAUNCHER_EXE
 from src.events import communicate
+from src.interaction.cloud_window import CLOUD_MAIN_TITLE
+from src.interaction.CloudNTEInteraction import CloudNTEInteraction
 from src.interaction.NTEInteraction import NTEInteraction
 from src.Labels import Labels
 from src.tasks.BaseNTETask import BaseNTETask
@@ -54,6 +56,19 @@ class DynamicConfig(dict):
             },
         }
 
+    @property
+    def CLOUD_CAPTURE_CONFIG(self):
+        return {
+            "windows": {
+                "exe": CLOUD_EXE,
+                "hwnd_class": "Qt51517QWindowIcon",
+                "title": CLOUD_MAIN_TITLE,
+                "interaction": CloudNTEInteraction,
+                # 后台截图只支持 WGC; 云客户端为 D3D 表面, BitBlt 不可用
+                "capture_method": ["WGC"],
+            },
+        }
+
 
 class LauncherTask(BaseNTETask):
     CONF_PATH = "Launcher Path"
@@ -72,6 +87,13 @@ class LauncherTask(BaseNTETask):
         dismiss_screensaver()
 
         if not self._check_admin():
+            return
+
+        cloud_proc = self._find_process(CLOUD_EXE)
+        self.log_info(f"Cloud game process check: {self._format_process(cloud_proc)}")
+        if cloud_proc:
+            self.log_info("Cloud client is running; preparing cloud capture")
+            self._wait_for_cloud_and_capture()
             return
 
         game_proc = self._find_process(GAME_EXE)
@@ -139,6 +161,40 @@ class LauncherTask(BaseNTETask):
         self.executor.device_manager.ensure_capture(self.capture_config.LAUNCHER_CAPTURE_CONFIG)
         self._log_task_state("after launcher ensure_capture")
         self.log_info("Launcher capture is ready; activating launcher window")
+
+    def _capture_cloud(self):
+        self.log_info(
+            f"Switching capture to cloud window: {self.capture_config.CLOUD_CAPTURE_CONFIG}"
+        )
+        self.executor.device_manager.ensure_capture(self.capture_config.CLOUD_CAPTURE_CONFIG)
+        self.log_info("Cloud capture is ready")
+
+    def _wait_for_cloud_and_capture(self, time_out=120):
+        if not self._wait_for_process(CLOUD_EXE, time_out=time_out, settle_window=False):
+            self.log_error("Timed out waiting for cloud game window")
+            raise TaskDisabledException("Timed out waiting for cloud game window")
+        self.log_info("Cloud game window found; switching capture to cloud")
+        self._capture_cloud()
+        self._wait_for_capture_connection()
+        resolution_error = og.app.start_controller.check_resolution()
+        if resolution_error:
+            self.log_error(f"resolution_error: {resolution_error}")
+            raise TaskDisabledException(f"Resolution Error: {resolution_error}")
+        self.scene.set_game_capture_ready(True)
+
+    def _wait_for_capture_connection(self, time_out=10):
+        deadline = time.time() + time_out
+        while time.time() < deadline:
+            if not self.executor.connected():
+                self.log_info("executor not connected try refresh")
+                self.executor.device_manager.refresh()
+                time.sleep(1.5)
+            else:
+                return
+        self.log_warning(
+            f"try refresh timeout {time_out}s, executor connect {self.executor.connected()}"
+        )
+        raise TaskDisabledException("Timed out waiting for game capture connection")
 
     def _log_task_state(self, point):
         current_task = getattr(self.executor, "current_task", None)
@@ -279,21 +335,7 @@ class LauncherTask(BaseNTETask):
                         raise e
                 else:
                     raise e
-        time_out = 10
-        deadline = time.time() + time_out
-        while time.time() < deadline:
-            if not self.executor.connected():
-                self.log_info("executor not connected try refresh")
-                self.executor.device_manager.refresh()
-                time.sleep(1.5)
-            else:
-                break
-        else:
-            self.log_warning(
-                f"try refresh timeout {time_out}s, executor connect {self.executor.connected()}"
-            )
-            raise TaskDisabledException("Timed out waiting for game capture connection")
-
+        self._wait_for_capture_connection()
         resolution_error = og.app.start_controller.check_resolution()
         if resolution_error:
             self.log_error(f"resolution_error: {resolution_error}")
@@ -370,6 +412,15 @@ class LauncherTask(BaseNTETask):
         if not proc:
             return None, 0
 
+        if exe_name == CLOUD_EXE:
+            capture_config = self.capture_config.CLOUD_CAPTURE_CONFIG["windows"]
+            return proc, self._find_window_for_process(
+                proc,
+                hwnd_class=capture_config["hwnd_class"],
+                require_title=require_title,
+                exact_title=CLOUD_MAIN_TITLE,
+            )
+
         capture_config = (
             self.capture_config.GAME_CAPTURE_CONFIG
             if exe_name == GAME_EXE
@@ -379,7 +430,9 @@ class LauncherTask(BaseNTETask):
             proc, hwnd_class=capture_config["hwnd_class"], require_title=require_title
         )
 
-    def _find_window_for_process(self, proc_info, hwnd_class=None, require_title=False):
+    def _find_window_for_process(
+        self, proc_info, hwnd_class=None, require_title=False, exact_title=None
+    ):
         pid = proc_info.get("pid")
         if not pid:
             return 0
@@ -398,6 +451,8 @@ class LauncherTask(BaseNTETask):
             if hwnd_class and win32gui.GetClassName(hwnd) != hwnd_class:
                 return True
             if require_title and not win32gui.GetWindowText(hwnd):
+                return True
+            if exact_title and win32gui.GetWindowText(hwnd) != exact_title:
                 return True
 
             matches.append(hwnd)

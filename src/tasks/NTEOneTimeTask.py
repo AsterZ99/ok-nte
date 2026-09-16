@@ -5,6 +5,9 @@ from ok.device.intercation import PynputInteraction
 class NTEOneTimeTask:
 
     def run(self, *args, **kwargs):
+        update = getattr(self, "update_capture_health", None)
+        if update is not None:
+            update()
         if not self.scene.game_capture_ready() or not self.executor.connected():
             self.log_warning("Game launch or capture initialization is incomplete; skipping task")
             raise TaskDisabledException("Game capture is not ready")

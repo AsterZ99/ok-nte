@@ -17,6 +17,7 @@ from ok import (
 )
 
 from src import text_black_color
+from src.interaction.cloud_window import CloudFrameHealth, assess_frame_health
 from src.Labels import Labels
 from src.scene.NTEScene import NTEScene
 from src.scene.ScreenPosition import ScreenPosition
@@ -959,6 +960,45 @@ class BaseNTETask(
         """判断当前应用语言是否为中文"""
 
         return "zh" in self.get_app_locale()
+
+    def update_capture_health(self, frame=None, throttle_seconds=5.0):
+        """周期性截图健康检查 (Phase 4): 失败时置 game_capture_ready=False。
+
+        有节流; 健康判定来自 src/interaction/cloud_window.assess_frame_health。
+        """
+        now = time.time()
+        last = getattr(self, "_capture_health_checked_at", 0.0)
+        if now - last < throttle_seconds:
+            return None
+        self._capture_health_checked_at = now
+
+        import win32gui
+
+        device_manager = og.device_manager
+        hwnd_window = getattr(device_manager, "hwnd_window", None)
+        hwnd = getattr(hwnd_window, "hwnd", 0) if hwnd_window else 0
+        hwnd_valid = bool(hwnd and win32gui.IsWindow(hwnd))
+
+        if frame is None:
+            frame = self.frame
+        if frame is None:
+            width = height = 0
+            content_ratio = 0.0
+        else:
+            height, width = frame.shape[:2]
+            content_ratio = float((frame[:, :, :3].max(axis=2) > 8).mean())
+
+        health = assess_frame_health(width, height, content_ratio, hwnd_valid)
+        ready = health == CloudFrameHealth.OK
+        if self.scene.game_capture_ready() != ready:
+            self.scene.set_game_capture_ready(ready)
+            log = self.log_warning if not ready else self.log_info
+            log(
+                f"capture health check: {health.value} "
+                f"({width}x{height}, content_ratio={content_ratio:.4f}); "
+                f"game_capture_ready -> {ready}"
+            )
+        return health
 
     def open_f1_domain_page(self):
         self.openF1panel()

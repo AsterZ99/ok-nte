@@ -12,6 +12,7 @@ if os.path.isdir(_sys32) and not _has_sys32:
 
 GAME_EXE = "HTGame.exe"
 LAUNCHER_EXE = ["NTEGame.exe", "NTEGlobalGame.exe", "NTETWGame.exe"]
+CLOUD_EXE = "NTECloudGame.exe"
 
 text_white_color = {
     "r": (244, 255),  # Red range
