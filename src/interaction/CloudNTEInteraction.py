@@ -118,18 +118,74 @@ class CloudNTEInteraction(NTEInteraction):
             logger.error(f"cloud input post failed hwnd={hwnd}: {error!r}")
             return False
 
+    def _scale_to_child(self, x, y):
+        """Map capture-frame coords to the child window's client coords."""
+        child = self.hwnd
+        try:
+            _left, _top, right, bottom = win32gui.GetClientRect(child)
+            client_w, client_h = right - _left, bottom - _top
+            frame_w, frame_h = self.capture.width, self.capture.height
+            if frame_w and frame_h and (client_w, client_h) != (frame_w, frame_h):
+                return round(x * client_w / frame_w), round(y * client_h / frame_h)
+        except Exception as error:
+            logger.warning(f"scale to child failed: {error!r}")
+        return int(x), int(y)
+
+    def _teleport_cursor(self, child, x, y):
+        """Save the real cursor once per operation, then move it to the target."""
+        if getattr(self, "_saved_cursor_pos", None) is None:
+            self._saved_cursor_pos = win32api.GetCursorPos()
+        screen = win32gui.ClientToScreen(child, (int(x), int(y)))
+        win32api.SetCursorPos(screen)
+
+    def _restore_cursor(self):
+        pos = getattr(self, "_saved_cursor_pos", None)
+        if pos is not None:
+            self._saved_cursor_pos = None
+            try:
+                win32api.SetCursorPos(pos)
+            except Exception as error:
+                logger.warning(f"restore cursor failed: {error!r}")
+
+    def _with_real_cursor(self, child, x, y, action, restore=True):
+        """Teleport the real cursor to the target client point, run, restore.
+
+        x/y must already be in the child window's client coords (see
+        _scale_to_child). The fake-activated client tracks the REAL OS cursor
+        position for its in-game cursor ("异环只能通过传递真实鼠标坐标实现
+        鼠标模拟"), so every mouse dispatch needs the cursor physically at
+        the target first.
+        """
+        try:
+            self._teleport_cursor(child, x, y)
+        except Exception as error:
+            logger.warning(f"teleport cursor failed: {error!r}")
+        try:
+            return action()
+        finally:
+            if restore:
+                self._restore_cursor()
+
     def move(self, x, y, down_btn=0):
-        self._leaf_post(win32con.WM_MOUSEMOVE, down_btn, x, y)
-        self.mouse_pos = (x, y)
+        child = self.hwnd
+        x, y = self._scale_to_child(x, y)
+
+        def dispatch():
+            self._leaf_post(win32con.WM_MOUSEMOVE, down_btn, x, y)
+            self.mouse_pos = (x, y)
+
+        # No restore: drag/swipe sequences need the cursor to stay at the
+        # moved position between steps; mouse_up releases it.
+        self._with_real_cursor(child, x, y, dispatch, restore=False)
         return (int(y) & 0xFFFF) << 16 | (int(x) & 0xFFFF)
 
     def click(self, x=-1, y=-1, move_back=False, name=None, down_time=0.01, move=True, key="left"):
-        # Background clicks verified on a live client (attack and dodge work).
-        # The real cursor is never moved, so no cursor sync or restore here.
         with self._input_lock:
             self.try_activate()
             if x < 0 or y < 0:
                 x, y = round(self.capture.width * 0.5), round(self.capture.height * 0.5)
+            child = self.hwnd
+            x, y = self._scale_to_child(x, y)
             if key == "left":
                 btn_down, btn_mk, btn_up = (
                     win32con.WM_LBUTTONDOWN,
@@ -148,12 +204,16 @@ class CloudNTEInteraction(NTEInteraction):
                     win32con.MK_RBUTTON,
                     win32con.WM_RBUTTONUP,
                 )
-            if move:
-                self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
+
+            def dispatch():
+                if move:
+                    self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
+                    time.sleep(down_time)
+                self._leaf_post(btn_down, btn_mk, x, y)
                 time.sleep(down_time)
-            self._leaf_post(btn_down, btn_mk, x, y)
-            time.sleep(down_time)
-            self._leaf_post(btn_up, 0, x, y)
+                self._leaf_post(btn_up, 0, x, y)
+
+            self._with_real_cursor(child, x, y, dispatch)
 
     def right_click(self, x=-1, y=-1, move_back=False, name=None):
         self.click(x, y, move_back=move_back, name=name, key="right")
@@ -163,30 +223,43 @@ class CloudNTEInteraction(NTEInteraction):
             self.try_activate()
             if x < 0 or y < 0:
                 x, y = round(self.capture.width * 0.5), round(self.capture.height * 0.5)
+            child = self.hwnd
+            x, y = self._scale_to_child(x, y)
             btn = {"left": win32con.MK_LBUTTON, "middle": win32con.MK_MBUTTON}.get(
                 key, win32con.MK_RBUTTON
             )
             action = {"left": win32con.WM_LBUTTONDOWN, "middle": win32con.WM_MBUTTONDOWN}.get(
                 key, win32con.WM_RBUTTONDOWN
             )
-            self._leaf_post(action, btn, x, y)
+
+            def dispatch():
+                self._leaf_post(action, btn, x, y)
+                self.mouse_pos = (x, y)
+
+            # Held press: the cursor stays at the target until mouse_up.
+            self._with_real_cursor(child, x, y, dispatch, restore=False)
 
     def mouse_up(self, key="left"):
         with self._input_lock:
             action = {"left": win32con.WM_LBUTTONUP, "middle": win32con.WM_MBUTTONUP}.get(
                 key, win32con.WM_RBUTTONUP
             )
-            x, y = getattr(self, "mouse_pos", (0, 0))
+            x, y = self._scale_to_child(*getattr(self, "mouse_pos", (0, 0)))
             self._leaf_post(action, 0, x, y)
+            self._restore_cursor()
 
     def scroll(self, x, y, scroll_amount):
         # Live-client status: background wheel is unconfirmed; the prior art
         # falls back to physical scrolling. We still post the message.
         with self._input_lock:
             self.try_activate()
+            child = self.hwnd
             wparam = win32api.MAKELONG(0, win32con.WHEEL_DELTA * scroll_amount)
             if x > 0 and y > 0:
-                self._leaf_post(win32con.WM_MOUSEWHEEL, wparam, x, y)
+                x, y = self._scale_to_child(x, y)
+                self._with_real_cursor(
+                    child, x, y, lambda: self._leaf_post(win32con.WM_MOUSEWHEEL, wparam, x, y)
+                )
             else:
                 self._leaf_post(win32con.WM_MOUSEWHEEL, wparam, 0, 0)
 
