@@ -54,6 +54,7 @@ class CloudNTEInteraction(NTEInteraction):
     FAKE_ACTIVATE_INTERVAL = 3.0
     DEACTIVATE_AFTER_DISPATCH = False
     MIN_CLICK_DOWN_TIME = 0.08
+    CURSOR_SETTLE_SECONDS = 0.25
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
