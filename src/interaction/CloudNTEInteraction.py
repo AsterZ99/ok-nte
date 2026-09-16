@@ -13,8 +13,19 @@ active. This class is the ok-script adapter; the input contracts live in
   leaf window. No foreground switching, no real-cursor movement, no
   ``mouse_event``/``SendInput`` — blocked or failing dispatches send nothing
   (audit A-01/A-02, fail closed);
+- activation is held by a short **lease** (audit §7.4 option 3). A single
+  synchronous ``WA_ACTIVE`` before a button is NOT enough: the live-client
+  matrix (2026-09-16, hands-off, three positions) showed the client drops the
+  button unless the activation is sustained. The lease re-asserts activation
+  every ``LEASE_REFRESH_SECONDS`` while input flows, and releases it once input
+  has been idle for ``LEASE_IDLE_SECONDS`` (``stop_lease``/``on_destroy``
+  release it explicitly);
 - logically pressed buttons are tracked and force-released on destroy
   (audit A-05).
+
+Held-lease caveat (documented, audit §7.4): while the lease is hot the client
+captures the real mouse, so real mouse movement affects the streamed game.
+The lease is therefore scoped to active input bursts and released on idle.
 
 Known limits (honest failures, audit WP-2):
 
@@ -25,6 +36,7 @@ Known limits (honest failures, audit WP-2):
   report, A-01); it lives only in git history.
 """
 
+import threading
 import time
 
 import win32con
@@ -50,14 +62,27 @@ logger = Logger.get_logger(__name__)
 class CloudNTEInteraction(NTEInteraction):
     """NTEInteraction variant targeting the cloud client's input surface."""
 
-    #: activation lease strategy (audit §7.4): activate per dispatch, release
-    #: queued after the input. The sustained background thread was removed:
-    #: the real-client matrix must prove it necessary before it returns.
-    DEACTIVATE_AFTER_DISPATCH = True
+    #: Activation lease (audit §7.4 option 3: keep active for a short lease,
+    #: release once input goes idle).
+    #:
+    #: Live-client matrix (2026-09-16, hands-off, three positions): a single
+    #: synchronous WA_ACTIVE before a button event is NOT enough — the client
+    #: drops the button. Sustaining the activation (re-asserting it on a short
+    #: interval) makes posted clicks work reliably, so the per-dispatch
+    #: activate+deactivate strategy was the actual cause of "click position is
+    #: right but nothing happens".
+    LEASE_REFRESH_SECONDS = 0.3
+    #: release the lease after this much idle time with no dispatch. While the
+    #: lease is held the client captures the real mouse (its documented
+    #: behavior), so the lease must not outlive the input burst.
+    LEASE_IDLE_SECONDS = 3.0
+    #: cold lease: assert activation and let the client open its forwarding
+    #: gate before the first button event of the burst.
+    LEASE_WARMUP_SECONDS = 0.3
     MIN_CLICK_DOWN_TIME = 0.08
-    #: gap between the posted MOVE and the button DOWN. Live-client matrix:
-    #: the DOWN must arrive within ~0.15s of the WM_ACTIVATE to be forwarded,
-    #: so this gap stays tiny (a long settle dropped every click).
+    #: gap between the posted MOVE and the button DOWN. Live-client matrix: the
+    #: DOWN must arrive within ~0.15s of the activation to be forwarded, so this
+    #: gap stays tiny (a long settle dropped every click).
     CURSOR_SETTLE_SECONDS = 0.05
 
     def __init__(self, *args, **kwargs):
@@ -68,6 +93,12 @@ class CloudNTEInteraction(NTEInteraction):
         self._frame_health = CloudFrameHealth.OK
         self._frame_observed_at = time.time()
         self._frame_size = (0, 0)
+        self._lease_lock = threading.Lock()
+        self._lease_active = False
+        self._lease_leaf = None
+        self._lease_deadline = 0.0
+        self._lease_thread = None
+        self._lease_wake = threading.Event()
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -89,7 +120,7 @@ class CloudNTEInteraction(NTEInteraction):
             except Exception as error:
                 logger.warning(f"cloud button cleanup failed: {error!r}")
         try:
-            self.release_fake_activation(post=False)
+            self.stop_lease()
         except Exception as error:
             logger.warning(f"release cloud fake activation failed: {error!r}")
         super().on_destroy()
@@ -172,24 +203,95 @@ class CloudNTEInteraction(NTEInteraction):
             win32gui.SendMessage(leaf, win32con.WM_ACTIVATE, win32con.WA_INACTIVE, 0)
 
     def try_activate(self):
-        self.fake_activate()
+        self._ensure_lease()
+
+    def activate(self):
+        """Task-start hook (``NTEOneTimeTask.run``): warm the lease.
+
+        Called before the task's first input so the lease is already hot when
+        the first dispatch happens.
+        """
+        self._ensure_lease()
+
+    def _ensure_lease(self, leaf=None):
+        """Start/extend the activation lease and re-assert activation now.
+
+        Every dispatch funnels through here: the activation is (re)sent right
+        before the input, and a background thread keeps re-asserting it while
+        the lease is hot. A cold lease warms up first, because the client drops
+        buttons that arrive without sustained activation.
+        """
+        leaf = leaf or self.hwnd
+        if not leaf:
+            return
+        with self._lease_lock:
+            cold = not self._lease_active
+            self._lease_active = True
+            self._lease_leaf = leaf
+            self._lease_deadline = time.time() + self.LEASE_IDLE_SECONDS
+            if cold:
+                self._lease_wake.clear()
+                self._lease_thread = threading.Thread(
+                    target=self._lease_loop, name="cloud-activation-lease", daemon=True
+                )
+                self._lease_thread.start()
+        self.fake_activate(leaf)
+        if cold:
+            time.sleep(self.LEASE_WARMUP_SECONDS)
+
+    def _lease_loop(self):
+        """Re-assert activation until the lease expires, then release once."""
+        while True:
+            if self._lease_wake.wait(self.LEASE_REFRESH_SECONDS):
+                return  # explicit stop
+            with self._lease_lock:
+                if not self._lease_active:
+                    return
+                leaf = self._lease_leaf
+                expired = time.time() >= self._lease_deadline
+                if expired:
+                    self._lease_active = False
+                    self._lease_leaf = None
+            if expired:
+                self._release_lease(leaf, post=True)
+                return
+            if not win32gui.IsWindow(leaf):
+                # the target vanished mid-lease: drop the lease quietly
+                with self._lease_lock:
+                    self._lease_active = False
+                    self._lease_leaf = None
+                return
+            try:
+                self.fake_activate(leaf)
+            except Exception as error:  # pragma: no cover - live client only
+                logger.warning(f"cloud lease refresh failed: {error!r}")
+                return
+
+    def _release_lease(self, leaf=None, post=True):
+        if leaf and not win32gui.IsWindow(leaf):
+            return  # nothing to release on a destroyed target
+        try:
+            self.release_fake_activation(post=post, leaf=leaf)
+        except Exception as error:
+            logger.warning(f"release fake activation failed: {error!r}")
+
+    def stop_lease(self):
+        """Explicit stop condition: release the lease and stop refreshing."""
+        with self._lease_lock:
+            leaf = self._lease_leaf
+            self._lease_active = False
+            self._lease_leaf = None
+        self._lease_wake.set()
+        self._release_lease(leaf, post=False)
 
     def _dispatch_with_activation(self, leaf, action):
-        """Activate, run the dispatch, then queue the release (audit §7.4)."""
+        """Extend the lease, then run the dispatch while the client is active.
 
-        def run():
-            self.fake_activate(leaf)
-            return action()
-
-        if self.DEACTIVATE_AFTER_DISPATCH:
-            try:
-                return run()
-            finally:
-                try:
-                    self.release_fake_activation(post=True, leaf=leaf)
-                except Exception as error:
-                    logger.warning(f"release fake activation failed: {error!r}")
-        return run()
+        No deactivation is queued here (audit §7.4): the lease thread releases
+        the activation once input goes idle.
+        """
+        self._ensure_lease(leaf)
+        return action()
 
     # -- dispatch plumbing ---------------------------------------------------------
 
@@ -330,19 +432,23 @@ class CloudNTEInteraction(NTEInteraction):
                     self.mouse_pos = result.leaf_point
                 return press_result
 
-            # Held press: the lease stays open (no queued deactivate) until
-            # mouse_up releases it, so the held button keeps being forwarded.
-            self.fake_activate(snapshot.leaf_hwnd)
-            return run()
+            # Held press: the lease stays hot (no release) so the held button
+            # keeps being forwarded; the lease thread releases it once input
+            # goes idle.
+            return self._dispatch_with_activation(snapshot.leaf_hwnd, run)
 
     def mouse_up(self, key="left"):
         with self._input_lock:
             result, snapshot = self._gate()
             if result.blocked or snapshot is None:
                 return result
-            release_result = self._pointer.release(snapshot, button=key)
-            self.release_fake_activation(post=True, leaf=snapshot.leaf_hwnd)
-            return release_result
+
+            def run():
+                return self._pointer.release(snapshot, button=key)
+
+            # The released button must be posted while still activated; the
+            # lease is intentionally NOT dropped here (idle expiry handles it).
+            return self._dispatch_with_activation(snapshot.leaf_hwnd, run)
 
     def scroll(self, x, y, scroll_amount):
         # Not proven on a real client (the prior art also fails here); honest

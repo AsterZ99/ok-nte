@@ -385,6 +385,159 @@ class TestFrameObservationHook(_LauncherTaskBase):
         task.scene.set_game_capture_ready.assert_called_once_with(True)
 
 
+class TestActivationLease(_LauncherTaskBase):
+    """Live matrix 2026-09-16: sustained activation is what makes clicks land.
+
+    A single synchronous WA_ACTIVE before the button is not enough — the
+    client drops the button. The lease keeps re-asserting activation while
+    input is flowing and releases it once input goes idle, so no WA_INACTIVE
+    may ever be queued between dispatches.
+    """
+
+    # resolved lazily: TestMouseMessageBackend is defined later in this module
+    def _make_interaction(self):
+        return TestMouseMessageBackend._make_interaction(self)
+
+    def _gate_patches(self):
+        return TestMouseMessageBackend._gate_patches(self)
+
+    def test_dispatch_never_queues_deactivate(self):
+        import win32con
+
+        interaction = self._make_interaction()
+        poster = interaction._pointer._poster
+
+        with (
+            self._gate_patches(),
+            patch("win32gui.SendMessage") as send_message,
+            patch("win32gui.PostMessage") as post_message,
+            patch("src.interaction.CloudNTEInteraction.threading.Thread"),
+            patch("time.sleep"),
+        ):
+            interaction.click(960, 540)
+            interaction.mouse_down(900, 500)
+            interaction.mouse_up()
+
+        # activation is asserted, never released between dispatches
+        for call in send_message.call_args_list:
+            self.assertEqual(call.args[1], win32con.WM_ACTIVATE)
+            self.assertEqual(call.args[2], win32con.WA_ACTIVE)
+        self.assertEqual(post_message.call_count, 0)
+        posted_messages = [call.args[1] for call in poster.call_args_list]
+        self.assertNotIn(win32con.WM_ACTIVATE, posted_messages)
+
+    def test_lease_is_reused_within_the_idle_window(self):
+        interaction = self._make_interaction()
+        started = []
+
+        class _FakeThread:
+            def __init__(self, *args, **kwargs):
+                started.append(kwargs.get("name"))
+
+            def start(self):
+                pass
+
+        with (
+            patch("src.interaction.CloudNTEInteraction.threading.Thread", _FakeThread),
+            patch("win32gui.SendMessage"),
+            patch("time.sleep"),
+        ):
+            interaction._ensure_lease(300)
+            interaction._ensure_lease(300)
+            interaction._ensure_lease(300)
+
+        self.assertEqual(started, ["cloud-activation-lease"])
+        self.assertTrue(interaction._lease_active)
+
+    def test_lease_refreshes_then_releases_when_idle(self):
+        import win32con
+
+        interaction = self._make_interaction()
+        interaction.LEASE_REFRESH_SECONDS = 0
+        interaction._lease_active = True
+        interaction._lease_leaf = 300
+        interaction._lease_deadline = 0  # already idle -> expire immediately
+
+        with (
+            patch.object(interaction._lease_wake, "wait", return_value=False),
+            patch("win32gui.IsWindow", return_value=True),
+            patch("win32gui.SendMessage") as send_message,
+            patch("win32gui.PostMessage") as post_message,
+        ):
+            interaction._lease_loop()
+
+        post_message.assert_called_once_with(
+            300, win32con.WM_ACTIVATE, win32con.WA_INACTIVE, 0
+        )
+        send_message.assert_not_called()
+        self.assertFalse(interaction._lease_active)
+
+    def test_lease_loop_refreshes_while_hot(self):
+        import time
+
+        interaction = self._make_interaction()
+        interaction.LEASE_REFRESH_SECONDS = 0
+        interaction._lease_active = True
+        interaction._lease_leaf = 300
+        interaction._lease_deadline = time.time() + 60
+
+        calls = []
+
+        def _wait(timeout):
+            calls.append(timeout)
+            if len(calls) >= 2:
+                interaction._lease_active = False  # end the loop
+            return False
+
+        with (
+            patch.object(interaction._lease_wake, "wait", side_effect=_wait),
+            patch("win32gui.IsWindow", return_value=True),
+            patch("win32gui.SendMessage") as send_message,
+            patch("win32gui.PostMessage") as post_message,
+        ):
+            interaction._lease_loop()
+
+        # hot lease: re-asserts activation, never releases
+        self.assertGreaterEqual(send_message.call_count, 1)
+        post_message.assert_not_called()
+
+    def test_stop_lease_releases_synchronously(self):
+        import win32con
+
+        interaction = self._make_interaction()
+        interaction._lease_active = True
+        interaction._lease_leaf = 300
+
+        with patch("win32gui.SendMessage") as send_message, patch(
+            "win32gui.PostMessage"
+        ) as post_message, patch("win32gui.IsWindow", return_value=True):
+            interaction.stop_lease()
+
+        send_message.assert_called_once_with(
+            300, win32con.WM_ACTIVATE, win32con.WA_INACTIVE, 0
+        )
+        post_message.assert_not_called()
+        self.assertFalse(interaction._lease_active)
+        self.assertTrue(interaction._lease_wake.is_set())
+
+    def test_on_destroy_stops_the_lease(self):
+        from src.interaction.NTEInteraction import NTEInteraction
+
+        interaction = self._make_interaction()
+        interaction._lease_active = True
+        interaction._lease_leaf = 300
+
+        with (
+            patch("win32gui.IsWindow", return_value=False),
+            patch("win32gui.SendMessage"),
+            patch.object(NTEInteraction, "on_destroy"),
+            patch("win32gui.PostMessage"),
+        ):
+            interaction.on_destroy()
+
+        self.assertFalse(interaction._lease_active)
+
+
 class TestOneTimeTaskHealthGate(unittest.TestCase):
     def test_one_time_task_runs_health_check_before_ready_gate(self):
         from src.tasks.NTEOneTimeTask import NTEOneTimeTask
@@ -425,6 +578,13 @@ class TestKeyboardDispatch(unittest.TestCase):
     """Regression: zero-arg super() inside a lambda raises 'super(): no
     arguments', which silently broke every cloud keyboard dispatch."""
 
+    def setUp(self):
+        # keep the activation lease from spawning a real background thread in
+        # tests (it would outlive the mocks and talk to a fake hwnd)
+        thread_patch = patch("src.interaction.CloudNTEInteraction.threading.Thread")
+        thread_patch.start()
+        self.addCleanup(thread_patch.stop)
+
     def _make_interaction(self):
         import threading
         import time
@@ -439,6 +599,12 @@ class TestKeyboardDispatch(unittest.TestCase):
         interaction._frame_health = CloudFrameHealth.OK
         interaction._frame_observed_at = time.time()
         interaction._frame_size = (0, 0)
+        interaction._lease_lock = threading.Lock()
+        interaction._lease_active = False
+        interaction._lease_leaf = None
+        interaction._lease_deadline = 0.0
+        interaction._lease_thread = None
+        interaction._lease_wake = threading.Event()
         interaction.hwnd_window = Mock()
         interaction.hwnd_window.hwnd = 100
         interaction.capture = Mock()
@@ -466,13 +632,16 @@ class TestKeyboardDispatch(unittest.TestCase):
             patch("src.interaction.CloudNTEInteraction.NTEInteraction") as parent,
             patch("win32gui.SendMessage") as send_message,
             patch("win32gui.PostMessage") as post_message,
+            patch("src.interaction.CloudNTEInteraction.threading.Thread"),
+            patch("time.sleep"),
         ):
             interaction.send_key("e")
 
             parent.send_key.assert_called_once_with(interaction, "e", 0.01)
-            # per-dispatch lease: sync activate, queued release
+            # lease model (2026-09-16 live matrix): activation is asserted for
+            # the dispatch and must NOT be released between dispatches.
             self.assertEqual(send_message.call_count, 1)
-            self.assertEqual(post_message.call_count, 1)
+            self.assertEqual(post_message.call_count, 0)
 
     def test_send_key_down_and_up_dispatch(self):
         interaction = self._make_interaction()
