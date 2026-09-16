@@ -78,3 +78,6 @@ site/
 !mid_lib/
 mid_lib/*
 !mid_lib/public
+
+# WorkBuddy agent workspace (local only)
+.workbuddy/

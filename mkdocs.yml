@@ -63,6 +63,7 @@ nav:
           - 从源码运行: zh-CN/development/running-from-source.md
           - SceneFlow 作者指南: zh-CN/development/scene_flow.md
           - Combat Planner 开发指南: zh-CN/development/combat-planner.md
+          - 云异环适配设计: zh-CN/development/云异环适配开发设计文档.md
 
 markdown_extensions:
   - admonition
