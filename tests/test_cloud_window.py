@@ -391,6 +391,51 @@ class FrameHealthTests(unittest.TestCase):
         self.assertEqual(health, cw.CloudFrameHealth.SIZE_TOO_SMALL)
 
 
+class EngagementTests(unittest.TestCase):
+    """Read-only engagement probe: does the client own the real foreground?
+
+    Motivated by a real-client report (2026-09-16): real mouse and keyboard do
+    nothing inside the streamed game until the window is clicked once.
+    """
+
+    def test_no_foreground_window(self):
+        state = cw.classify_engagement(0, (100, 300), lambda hwnd: False)
+        self.assertEqual(state, cw.CloudEngagement.NONE)
+
+    def test_main_window_owns_the_foreground(self):
+        state = cw.classify_engagement(100, (100, 300), lambda hwnd: False)
+        self.assertEqual(state, cw.CloudEngagement.ENGAGED)
+
+    def test_input_leaf_owns_the_foreground(self):
+        state = cw.classify_engagement(300, (100, 300), lambda hwnd: False)
+        self.assertEqual(state, cw.CloudEngagement.ENGAGED)
+
+    def test_descendant_owns_the_foreground(self):
+        state = cw.classify_engagement(999, (100, 300), lambda hwnd: hwnd == 999)
+        self.assertEqual(state, cw.CloudEngagement.ENGAGED)
+
+    def test_other_window_owns_the_foreground(self):
+        state = cw.classify_engagement(555, (100, 300), lambda hwnd: False)
+        self.assertEqual(state, cw.CloudEngagement.BACKGROUND)
+
+    def test_descendant_probe_failure_is_unknown_not_a_guess(self):
+        def boom(_hwnd):
+            raise OSError("no such window")
+
+        state = cw.classify_engagement(555, (100, 300), boom)
+        self.assertEqual(state, cw.CloudEngagement.UNKNOWN)
+
+    def test_cursor_containment_uses_explicit_geometry(self):
+        rect = (100, 200, 500, 600)
+        self.assertTrue(cw.cursor_inside_window(1, cursor_pos=(300, 400), window_rect=rect))
+        self.assertTrue(cw.cursor_inside_window(1, cursor_pos=(100, 200), window_rect=rect))
+        self.assertFalse(cw.cursor_inside_window(1, cursor_pos=(99, 400), window_rect=rect))
+        self.assertFalse(cw.cursor_inside_window(1, cursor_pos=(500, 400), window_rect=rect))
+
+    def test_cursor_containment_without_a_window_is_unknown(self):
+        self.assertIsNone(cw.cursor_inside_window(0))
+
+
 class TreeRenderTests(unittest.TestCase):
     def test_children_are_indented_under_their_parent(self):
         parent = cloud_window(hwnd=200)

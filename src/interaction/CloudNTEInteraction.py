@@ -27,6 +27,18 @@ Held-lease caveat (documented, audit §7.4): while the lease is hot the client
 captures the real mouse, so real mouse movement affects the streamed game.
 The lease is therefore scoped to active input bursts and released on idle.
 
+Open question — genuine engagement. Real-client report (2026-09-16): real
+mouse and keyboard produce nothing inside the streamed game until the window
+is clicked once, after which they work. If the client gates forwarding behind
+genuine engagement (real foreground ownership / a real click), posted messages
+alone can never be sufficient, and sustained fake activation only works while
+the condition happens to hold. Every dispatch therefore records a read-only
+:func:`observe_engagement` sample (foreground owner + cursor containment) and
+the totals are logged at destroy, so a single real task run decides the
+question without a separate experiment. Taking the foreground is deliberately
+NOT done by default (``ENGAGE_FOREGROUND_ON_START = False``, audit A-01); the
+reviewed opt-in path is :meth:`CloudNTEInteraction.engage_foreground`.
+
 Known limits (honest failures, audit WP-2):
 
 - scroll is ``UNSUPPORTED`` until the real-client matrix proves it;
@@ -53,7 +65,13 @@ from src.interaction.cloud_mouse import (
     CloudMessagePointer,
     validate_dispatch,
 )
-from src.interaction.cloud_window import CloudFrameHealth, find_cloud_input_child
+from src.interaction.cloud_window import (
+    CloudEngagement,
+    CloudFrameHealth,
+    find_cloud_input_child,
+    force_foreground,
+    observe_engagement,
+)
 from src.interaction.NTEInteraction import NTEInteraction
 
 logger = Logger.get_logger(__name__)
@@ -87,6 +105,12 @@ class CloudNTEInteraction(NTEInteraction):
     #: gap stays tiny (a long settle dropped every click).
     CURSOR_SETTLE_SECONDS = 0.05
 
+    #: Engagement policy. ``False`` = observe only (audit A-01 forbids stealing
+    #: the foreground). Real-client observation (2026-09-16) suggests the
+    #: client forwards input only while it genuinely owns the foreground, so
+    #: the observation below is what decides whether this must be flipped.
+    ENGAGE_FOREGROUND_ON_START = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._pointer = CloudMessagePointer(self._post_message)
@@ -101,6 +125,10 @@ class CloudNTEInteraction(NTEInteraction):
         self._lease_deadline = 0.0
         self._lease_thread = None
         self._lease_wake = threading.Event()
+        self._engagement = None
+        self._engagement_counts = {}
+        self._cursor_outside_count = 0
+        self._background_warned = False
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -125,6 +153,13 @@ class CloudNTEInteraction(NTEInteraction):
             self.stop_lease()
         except Exception as error:
             logger.warning(f"release cloud fake activation failed: {error!r}")
+        report = self.engagement_report()
+        if report["counts"]:
+            logger.info(
+                "cloud engagement summary: "
+                f"counts={report['counts']} cursor_outside={report['cursor_outside_count']} "
+                f"last_state={report['last_state']}"
+            )
         super().on_destroy()
 
     # -- target resolution -----------------------------------------------------
@@ -150,6 +185,7 @@ class CloudNTEInteraction(NTEInteraction):
         if main_pid != leaf_pid or main_pid <= 0:
             logger.warning("cloud target rejected: pid mismatch across the chain")
             return None
+        self._observe_engagement(main, leaf)
         try:
             left, top, right, bottom = win32gui.GetClientRect(leaf)
         except Exception as error:
@@ -179,6 +215,59 @@ class CloudNTEInteraction(NTEInteraction):
     def hwnd(self):
         """The verified leaf input surface, or 0 — never a fallback (A-02)."""
         return self._last_target[1] if self._last_target[1] else 0
+
+    # -- engagement observation (read-only) -----------------------------------------
+
+    def _observe_engagement(self, main, leaf):
+        """Record whether the client owns the real foreground, per dispatch.
+
+        Read-only: never changes focus, never moves the cursor. The counters
+        are the evidence that settles whether the client gates input
+        forwarding behind genuine engagement (user report, 2026-09-16: real
+        mouse/keyboard do nothing until the window is clicked once).
+        """
+        try:
+            state = observe_engagement(main, leaf)
+        except Exception as error:  # pragma: no cover - defensive
+            logger.warning(f"cloud engagement probe failed: {error!r}")
+            return
+        self._engagement = state
+        self._engagement_counts[state.state.value] = (
+            self._engagement_counts.get(state.state.value, 0) + 1
+        )
+        if state.cursor_inside is False:
+            self._cursor_outside_count += 1
+        if state.state is CloudEngagement.ENGAGED:
+            self._background_warned = False
+            return
+        if state.state is CloudEngagement.BACKGROUND and not self._background_warned:
+            self._background_warned = True
+            logger.warning(
+                "cloud client does not own the foreground "
+                f"(foreground_hwnd={state.foreground_hwnd}, cursor_inside="
+                f"{state.cursor_inside}); this client forwards input only while "
+                "it is engaged, so dispatches may be dropped by the client"
+            )
+
+    def engagement_report(self):
+        """Counters collected so far. Diagnostics/test surface, not control."""
+        state = self._engagement
+        return {
+            "counts": dict(self._engagement_counts),
+            "cursor_outside_count": self._cursor_outside_count,
+            "last_state": state.state.value if state else None,
+            "last_foreground_hwnd": state.foreground_hwnd if state else 0,
+            "last_cursor_inside": state.cursor_inside if state else None,
+        }
+
+    def engage_foreground(self):
+        """Opt-in foreground hand-off (default off, see the class constant)."""
+        main = self.hwnd_window.hwnd if self.hwnd_window else 0
+        if not main or not win32gui.IsWindow(main):
+            return False
+        gained = force_foreground(main)
+        logger.warning(f"cloud engagement: forced foreground on hwnd={main} -> {gained}")
+        return gained
 
     # -- activation lease --------------------------------------------------------
 
@@ -213,6 +302,8 @@ class CloudNTEInteraction(NTEInteraction):
         Called before the task's first input so the lease is already hot when
         the first dispatch happens.
         """
+        if self.ENGAGE_FOREGROUND_ON_START:
+            self.engage_foreground()
         self._ensure_lease()
 
     def _ensure_lease(self, leaf=None):

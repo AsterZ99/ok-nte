@@ -137,6 +137,138 @@ class CloudFrameHealth(Enum):
     BLACK = "black"
 
 
+class CloudEngagement(Enum):
+    """Whether the cloud client currently owns the real foreground.
+
+    Real-client report (2026-09-16, user observation): moving the real mouse
+    or pressing real keys does nothing inside the streamed game until the
+    window is clicked once — i.e. the client appears to gate input forwarding
+    behind a genuine engagement signal that posted messages do not produce.
+    This enum is the read-only observation used to confirm or refute that,
+    never an action by itself.
+    """
+
+    ENGAGED = "engaged"
+    BACKGROUND = "background"
+    NONE = "none"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class CloudEngagementState:
+    state: CloudEngagement
+    foreground_hwnd: int
+    cursor_inside: bool | None
+
+
+def classify_engagement(foreground_hwnd, owned_hwnds, is_descendant):
+    """Classify foreground ownership. Pure function.
+
+    ``owned_hwnds`` are the hwnds that belong to the cloud client (main window
+    and its input leaf); ``is_descendant(hwnd)`` reports whether an arbitrary
+    hwnd is a descendant of the cloud main window. Either match means the
+    client owns the foreground.
+    """
+    if not foreground_hwnd:
+        return CloudEngagement.NONE
+    if foreground_hwnd in tuple(owned_hwnds):
+        return CloudEngagement.ENGAGED
+    try:
+        if is_descendant(foreground_hwnd):
+            return CloudEngagement.ENGAGED
+    except Exception:
+        return CloudEngagement.UNKNOWN
+    return CloudEngagement.BACKGROUND
+
+
+def cursor_inside_window(hwnd, cursor_pos=None, window_rect=None):
+    """Whether the real cursor is inside the window rect. Pure function."""
+    if not hwnd:
+        return None
+    try:
+        if cursor_pos is None:
+            import win32gui
+
+            cursor_pos = win32gui.GetCursorPos()
+        if window_rect is None:
+            import win32gui
+
+            window_rect = win32gui.GetWindowRect(hwnd)
+    except Exception:
+        return None
+    left, top, right, bottom = window_rect
+    x, y = cursor_pos
+    return left <= x < right and top <= y < bottom
+
+
+def observe_engagement(main_hwnd, leaf_hwnd=0):
+    """Read-only snapshot of foreground ownership + cursor containment.
+
+    Never changes focus and never moves the cursor — safe to call on every
+    dispatch. Returns ``UNKNOWN`` when the Win32 probe is unavailable.
+    """
+    if not HAVE_PYWIN32:
+        return CloudEngagementState(CloudEngagement.UNKNOWN, 0, None)
+    try:
+        import win32gui
+
+        foreground = int(win32gui.GetForegroundWindow() or 0)
+    except Exception:
+        return CloudEngagementState(CloudEngagement.UNKNOWN, 0, None)
+    owned = tuple(hwnd for hwnd in (main_hwnd, leaf_hwnd) if hwnd)
+
+    def is_descendant(hwnd):
+        if not main_hwnd:
+            return False
+        return bool(win32gui.IsChild(main_hwnd, hwnd))
+
+    state = classify_engagement(foreground, owned, is_descendant)
+    return CloudEngagementState(
+        state=state,
+        foreground_hwnd=foreground,
+        cursor_inside=cursor_inside_window(main_hwnd or leaf_hwnd),
+    )
+
+
+def force_foreground(hwnd):
+    """Try to hand the real foreground to ``hwnd``. Returns True on success.
+
+    Off by default and never called from the dispatch path: the audit contract
+    (A-01) forbids foreground stealing. It exists so the engagement question
+    can be answered with a controlled experiment, and so a future explicit
+    opt-in policy has one reviewed implementation instead of ad-hoc code.
+    """
+    if not HAVE_PYWIN32 or not hwnd:
+        return False
+    import win32api
+    import win32gui
+    import win32process
+
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, 3)  # SW_MAXIMIZE keeps the game visible
+        current = win32api.GetCurrentThreadId()
+        target = win32process.GetWindowThreadProcessId(hwnd)[0]
+        foreground = int(win32gui.GetForegroundWindow() or 0)
+        fg_thread = win32process.GetWindowThreadProcessId(foreground)[0] if foreground else 0
+        attached = []
+        try:
+            for thread_id in {fg_thread, target}:
+                if thread_id and thread_id != current:
+                    win32process.AttachThreadInput(current, thread_id, True)
+                    attached.append(thread_id)
+            win32gui.BringWindowToTop(hwnd)
+            if not win32gui.SetForegroundWindow(hwnd):
+                return False
+        finally:
+            for thread_id in attached:
+                win32process.AttachThreadInput(current, thread_id, False)
+    except Exception as error:
+        logger.warning(f"force_foreground failed for hwnd={hwnd}: {error!r}")
+        return False
+    return int(win32gui.GetForegroundWindow() or 0) == hwnd
+
+
 def redact_title(title):
     if not title:
         return ""

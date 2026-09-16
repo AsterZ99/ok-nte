@@ -605,6 +605,10 @@ class TestKeyboardDispatch(unittest.TestCase):
         interaction._lease_deadline = 0.0
         interaction._lease_thread = None
         interaction._lease_wake = threading.Event()
+        interaction._engagement = None
+        interaction._engagement_counts = {}
+        interaction._cursor_outside_count = 0
+        interaction._background_warned = False
         interaction.hwnd_window = Mock()
         interaction.hwnd_window.hwnd = 100
         interaction.capture = Mock()
@@ -615,6 +619,8 @@ class TestKeyboardDispatch(unittest.TestCase):
     def _gate_patches(self):
         from contextlib import ExitStack
 
+        from src.interaction.cloud_window import CloudEngagement, CloudEngagementState
+
         stack = ExitStack()
         stack.enter_context(
             patch("src.interaction.CloudNTEInteraction.find_cloud_input_child", return_value=300)
@@ -622,6 +628,14 @@ class TestKeyboardDispatch(unittest.TestCase):
         stack.enter_context(patch("win32gui.IsWindow", return_value=True))
         stack.enter_context(patch("win32process.GetWindowThreadProcessId", return_value=(1, 42)))
         stack.enter_context(patch("win32gui.GetClientRect", return_value=(0, 0, 1920, 1080)))
+        # dispatch tests assert message behaviour, not engagement sampling; the
+        # engagement suite patches this again with its own sequence.
+        stack.enter_context(
+            patch(
+                "src.interaction.CloudNTEInteraction.observe_engagement",
+                return_value=CloudEngagementState(CloudEngagement.ENGAGED, 100, True),
+            )
+        )
         return stack
 
     def test_send_key_dispatches_through_fake_activation(self):
@@ -833,6 +847,177 @@ class TestMouseMessageBackend(TestKeyboardDispatch):
         self.assertTrue(result.blocked)
         self.assertEqual(result.reason.value, "unsupported")
         log_mock.warning.assert_called()
+
+
+class TestEngagementObservation(TestMouseMessageBackend):
+    """Real-client report 2026-09-16: input seems gated behind genuine
+    engagement (a real click in the window). The dispatch path must record
+    read-only evidence for that, and must never steal the foreground by
+    default (audit A-01).
+    """
+
+    def _state(self, state, cursor_inside=True, foreground_hwnd=555):
+        from src.interaction.cloud_window import CloudEngagementState
+
+        return CloudEngagementState(
+            state=state, foreground_hwnd=foreground_hwnd, cursor_inside=cursor_inside
+        )
+
+    def test_gate_records_every_observation(self):
+        from src.interaction.cloud_window import CloudEngagement
+
+        interaction = self._make_interaction()
+        states = [CloudEngagement.ENGAGED, CloudEngagement.BACKGROUND]
+
+        with (
+            self._gate_patches(),
+            patch(
+                "src.interaction.CloudNTEInteraction.observe_engagement",
+                side_effect=lambda *a, **k: self._state(states.pop(0)),
+            ),
+            patch("src.interaction.CloudNTEInteraction.logger"),
+            patch("win32gui.PostMessage"),
+            patch("win32gui.SendMessage"),
+            patch("time.sleep"),
+        ):
+            interaction._gate((10, 10))
+            interaction._gate((10, 10))
+
+        report = interaction.engagement_report()
+        self.assertEqual(report["counts"], {"engaged": 1, "background": 1})
+        self.assertEqual(report["last_state"], "background")
+
+    def test_background_warns_once_per_episode_then_again_after_engage(self):
+        from src.interaction.cloud_window import CloudEngagement
+
+        interaction = self._make_interaction()
+        sequence = [
+            CloudEngagement.BACKGROUND,
+            CloudEngagement.BACKGROUND,
+            CloudEngagement.ENGAGED,
+            CloudEngagement.BACKGROUND,
+        ]
+
+        with (
+            self._gate_patches(),
+            patch(
+                "src.interaction.CloudNTEInteraction.observe_engagement",
+                side_effect=lambda *a, **k: self._state(sequence.pop(0)),
+            ),
+            patch("src.interaction.CloudNTEInteraction.logger") as log_mock,
+        ):
+            for _ in range(4):
+                interaction._gate((10, 10))
+
+        warnings = [call for call in log_mock.warning.call_args_list]
+        self.assertEqual(len(warnings), 2, "background must warn once per episode")
+        self.assertIn("does not own the foreground", warnings[0].args[0])
+
+    def test_cursor_outside_window_is_counted(self):
+        from src.interaction.cloud_window import CloudEngagement
+
+        interaction = self._make_interaction()
+
+        with (
+            self._gate_patches(),
+            patch(
+                "src.interaction.CloudNTEInteraction.observe_engagement",
+                return_value=self._state(CloudEngagement.ENGAGED, cursor_inside=False),
+            ),
+            patch("src.interaction.CloudNTEInteraction.logger"),
+        ):
+            interaction._gate((10, 10))
+            interaction._gate((10, 10))
+
+        self.assertEqual(interaction.engagement_report()["cursor_outside_count"], 2)
+
+    def test_probe_failure_never_breaks_dispatch(self):
+        interaction = self._make_interaction()
+
+        with (
+            self._gate_patches(),
+            patch(
+                "src.interaction.CloudNTEInteraction.observe_engagement",
+                side_effect=RuntimeError("probe exploded"),
+            ),
+            patch("src.interaction.CloudNTEInteraction.logger") as log_mock,
+        ):
+            result, snapshot = interaction._gate((10, 10))
+
+        self.assertFalse(result.blocked)
+        self.assertIsNotNone(snapshot)
+        log_mock.warning.assert_called()
+
+    def test_foreground_is_never_taken_by_default(self):
+        from src.interaction.cloud_window import CloudEngagement
+
+        interaction = self._make_interaction()
+
+        with (
+            self._gate_patches(),
+            patch(
+                "src.interaction.CloudNTEInteraction.observe_engagement",
+                return_value=self._state(CloudEngagement.BACKGROUND, cursor_inside=False),
+            ),
+            patch("src.interaction.CloudNTEInteraction.force_foreground") as steal,
+            patch("src.interaction.CloudNTEInteraction.logger"),
+            patch("win32gui.SendMessage"),
+            patch("time.sleep"),
+        ):
+            interaction._gate((10, 10))
+            interaction.activate()
+
+        steal.assert_not_called()
+        self.assertFalse(CloudNTEInteraction.ENGAGE_FOREGROUND_ON_START)
+
+    def test_opt_in_engagement_takes_the_foreground(self):
+        from src.interaction.cloud_window import CloudEngagement
+
+        interaction = self._make_interaction()
+        interaction.ENGAGE_FOREGROUND_ON_START = True
+
+        with (
+            self._gate_patches(),
+            patch(
+                "src.interaction.CloudNTEInteraction.observe_engagement",
+                return_value=self._state(CloudEngagement.BACKGROUND),
+            ),
+            patch(
+                "src.interaction.CloudNTEInteraction.force_foreground",
+                return_value=True,
+            ) as steal,
+            patch("win32gui.IsWindow", return_value=True),
+            patch("src.interaction.CloudNTEInteraction.logger"),
+        ):
+            self.assertTrue(interaction.engage_foreground())
+
+        steal.assert_called_once_with(100)
+
+    def test_engage_foreground_fails_closed_without_main_window(self):
+        interaction = self._make_interaction()
+        interaction.hwnd_window = None
+
+        with patch("src.interaction.CloudNTEInteraction.force_foreground") as steal:
+            self.assertFalse(interaction.engage_foreground())
+
+        steal.assert_not_called()
+
+    def test_destroy_logs_engagement_summary(self):
+        interaction = self._make_interaction()
+        interaction._engagement_counts = {"background": 12}
+
+        with (
+            patch("win32gui.IsWindow", return_value=True),
+            patch("win32gui.PostMessage"),
+            patch("win32gui.SendMessage"),
+            patch("src.interaction.NTEInteraction.NTEInteraction.on_destroy"),
+            patch("src.interaction.CloudNTEInteraction.logger") as log_mock,
+        ):
+            interaction.on_destroy()
+
+        summary = [call for call in log_mock.info.call_args_list if "summary" in call.args[0]]
+        self.assertEqual(len(summary), 1)
+        self.assertIn("background", summary[0].args[0])
 
 
 if __name__ == "__main__":
