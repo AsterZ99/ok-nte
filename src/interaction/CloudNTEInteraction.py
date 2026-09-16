@@ -53,7 +53,7 @@ class CloudNTEInteraction(NTEInteraction):
 
     FAKE_ACTIVATE_INTERVAL = 3.0
     DEACTIVATE_AFTER_DISPATCH = True
-    MIN_CLICK_DOWN_TIME = 0.05
+    MIN_CLICK_DOWN_TIME = 0.08
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -79,7 +79,9 @@ class CloudNTEInteraction(NTEInteraction):
                 result = run()
             finally:
                 try:
-                    self.release_fake_activation()
+                    # Queued (PostMessage) so the client processes the input
+                    # messages first, then deactivates.
+                    self.release_fake_activation(post=True)
                 except Exception as error:
                     logger.warning(f"release fake activation failed: {error!r}")
             return result
@@ -106,9 +108,20 @@ class CloudNTEInteraction(NTEInteraction):
             win32gui.SendMessage(child, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
         return child
 
-    def release_fake_activation(self):
+    def release_fake_activation(self, post=True):
+        """Release the fake activation.
+
+        ``post=True`` queues the WA_INACTIVE *after* already-posted input
+        messages, so the client processes them while still active. A
+        synchronous SendMessage here would jump the queue and deactivate the
+        client before it processes the queued clicks/keys, dropping them.
+        """
         child = self.cloud_input_child()
-        if child:
+        if not child:
+            return
+        if post:
+            win32gui.PostMessage(child, win32con.WM_ACTIVATE, win32con.WA_INACTIVE, 0)
+        else:
             win32gui.SendMessage(child, win32con.WM_ACTIVATE, win32con.WA_INACTIVE, 0)
 
     def _fake_activate_loop(self):
@@ -126,7 +139,7 @@ class CloudNTEInteraction(NTEInteraction):
     def on_destroy(self):
         self._fake_activate_stop.set()
         try:
-            self.release_fake_activation()
+            self.release_fake_activation(post=False)
         except Exception as error:
             logger.warning(f"release cloud fake activation failed: {error!r}")
         super().on_destroy()
@@ -316,7 +329,8 @@ class CloudNTEInteraction(NTEInteraction):
             self._leaf_post(action, 0, x, y)
             self._restore_cursor()
             if self.DEACTIVATE_AFTER_DISPATCH:
-                self.release_fake_activation()
+                # Queued after the button-up message.
+                self.release_fake_activation(post=True)
 
     def scroll(self, x, y, scroll_amount):
         # Live-client status: background wheel is unconfirmed; the prior art
