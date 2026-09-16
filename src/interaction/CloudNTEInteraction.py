@@ -197,13 +197,25 @@ class CloudNTEInteraction(NTEInteraction):
         return int(x), int(y)
 
     def _teleport_cursor(self, child, x, y):
-        """Save the real cursor once per operation, then move it to the target."""
+        """Save the real cursor once, then move it to the target.
+
+        A pending delayed restore is cancelled: consecutive clicks must keep
+        the cursor at their targets until the client has processed them.
+        """
+        timer = getattr(self, "_restore_timer", None)
+        if timer is not None:
+            timer.cancel()
+            self._restore_timer = None
         if getattr(self, "_saved_cursor_pos", None) is None:
             self._saved_cursor_pos = win32api.GetCursorPos()
         screen = win32gui.ClientToScreen(child, (int(x), int(y)))
         win32api.SetCursorPos(screen)
 
     def _restore_cursor(self):
+        timer = getattr(self, "_restore_timer", None)
+        if timer is not None:
+            timer.cancel()
+            self._restore_timer = None
         pos = getattr(self, "_saved_cursor_pos", None)
         if pos is not None:
             self._saved_cursor_pos = None
@@ -211,6 +223,18 @@ class CloudNTEInteraction(NTEInteraction):
                 win32api.SetCursorPos(pos)
             except Exception as error:
                 logger.warning(f"restore cursor failed: {error!r}")
+
+    def _restore_cursor_later(self, delay=0.5):
+        """Restore the real cursor after the client processed the input.
+
+        Restoring immediately races the client's message loop: while handling
+        the queued click it reads the REAL cursor position, which must still
+        be at the target. The prior art waits seconds before restoring.
+        """
+        timer = threading.Timer(delay, self._restore_cursor)
+        timer.daemon = True
+        self._restore_timer = timer
+        timer.start()
 
     def _with_real_cursor(self, child, x, y, action, restore=True):
         """Teleport the real cursor to the target client point, run, restore.
@@ -289,6 +313,7 @@ class CloudNTEInteraction(NTEInteraction):
 
             def run():
                 self._with_real_cursor(child, x, y, dispatch)
+                self._restore_cursor_later()
 
             self._dispatch_with_activation(run)
 
@@ -326,7 +351,7 @@ class CloudNTEInteraction(NTEInteraction):
             )
             x, y = self._scale_to_child(*getattr(self, "mouse_pos", (0, 0)))
             self._leaf_post(action, 0, x, y)
-            self._restore_cursor()
+            self._restore_cursor_later()
             if self.DEACTIVATE_AFTER_DISPATCH:
                 # Queued after the button-up message.
                 self.release_fake_activation(post=True)
