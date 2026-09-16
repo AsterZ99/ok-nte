@@ -55,7 +55,10 @@ class CloudNTEInteraction(NTEInteraction):
     #: the real-client matrix must prove it necessary before it returns.
     DEACTIVATE_AFTER_DISPATCH = True
     MIN_CLICK_DOWN_TIME = 0.08
-    CURSOR_SETTLE_SECONDS = 0.4
+    #: gap between the posted MOVE and the button DOWN. Live-client matrix:
+    #: the DOWN must arrive within ~0.15s of the WM_ACTIVATE to be forwarded,
+    #: so this gap stays tiny (a long settle dropped every click).
+    CURSOR_SETTLE_SECONDS = 0.05
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -297,10 +300,12 @@ class CloudNTEInteraction(NTEInteraction):
                 return result
 
             def run():
+                # Live-client matrix (2026-09-16): the button event must reach
+                # the leaf within ~0.15s of the activation to be forwarded.
+                # A long settle between activation and DOWN drops the click.
                 if move:
                     self._pointer.move(snapshot, result.leaf_point)
                     time.sleep(self.CURSOR_SETTLE_SECONDS)
-                # Streaming latency needs a more deliberate press than local.
                 return self._pointer.click(
                     snapshot,
                     result.leaf_point,
@@ -318,17 +323,26 @@ class CloudNTEInteraction(NTEInteraction):
             result, snapshot = self._gate((x, y))
             if result.blocked or snapshot is None:
                 return result
-            press_result = self._pointer.press(snapshot, result.leaf_point, button=key)
-            if press_result.ok:
-                self.mouse_pos = result.leaf_point
-            return press_result
+
+            def run():
+                press_result = self._pointer.press(snapshot, result.leaf_point, button=key)
+                if press_result.ok:
+                    self.mouse_pos = result.leaf_point
+                return press_result
+
+            # Held press: the lease stays open (no queued deactivate) until
+            # mouse_up releases it, so the held button keeps being forwarded.
+            self.fake_activate(snapshot.leaf_hwnd)
+            return run()
 
     def mouse_up(self, key="left"):
         with self._input_lock:
             result, snapshot = self._gate()
             if result.blocked or snapshot is None:
                 return result
-            return self._pointer.release(snapshot, button=key)
+            release_result = self._pointer.release(snapshot, button=key)
+            self.release_fake_activation(post=True, leaf=snapshot.leaf_hwnd)
+            return release_result
 
     def scroll(self, x, y, scroll_amount):
         # Not proven on a real client (the prior art also fails here); honest

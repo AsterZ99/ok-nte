@@ -271,9 +271,14 @@ def run_foreground_sendinput(resolution, output_dir):
     return 0
 
 
-def run_mouse_sequence(sequence_id, target, output_dir, countdown):
-    """Run ONE message recipe (audit §8.2, M0-M4) and record evidence."""
+def run_mouse_sequence(sequence_id, target, output_dir, countdown, capture_hwnd=None):
+    """Run ONE message recipe (audit §8.2, M0-M4) and record evidence.
+
+    Frames are captured from ``capture_hwnd`` (the WGC-capturable main
+    window); the leaf window itself is usually not capturable.
+    """
     hwnd = target["hwnd"]
+    capture_hwnd = capture_hwnd or hwnd
     left, top, right, bottom = win32gui.GetClientRect(hwnd)
     cx, cy = (right - left) // 2, (bottom - top) // 2
     screen = win32gui.ClientToScreen(hwnd, (cx, cy))
@@ -285,7 +290,7 @@ def run_mouse_sequence(sequence_id, target, output_dir, countdown):
     time.sleep(countdown)
 
     before_state = observe()
-    before_frame = grab_frame(hwnd)
+    before_frame = grab_frame(capture_hwnd)
     entries = []
 
     def note(action, sent):
@@ -349,7 +354,7 @@ def run_mouse_sequence(sequence_id, target, output_dir, countdown):
             return 1
 
         time.sleep(INPUT_WAIT_SECONDS)
-        after_frame = grab_frame(hwnd)
+        after_frame = grab_frame(capture_hwnd)
         diff = frame_diff(before_frame, after_frame)
         entries[-1]["diff_ratio"] = None if diff is None else round(diff, 4)
         print(f"  diff_ratio={entries[-1]['diff_ratio']} (hint only; human decides)")
@@ -441,7 +446,9 @@ def main(argv=None):
         if not args.allow_input:
             print("dry run: pass --allow-input to actually send input")
             return 0
-        return run_mouse_sequence(args.mouse_sequence, target, output_dir, args.countdown)
+        return run_mouse_sequence(
+            args.mouse_sequence, target, output_dir, args.countdown, capture_hwnd=main_hwnd
+        )
 
     if not args.allow_input:
         print("dry run: pass --allow-input to actually send input")

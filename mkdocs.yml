@@ -64,6 +64,7 @@ nav:
           - SceneFlow 作者指南: zh-CN/development/scene_flow.md
           - Combat Planner 开发指南: zh-CN/development/combat-planner.md
           - 云异环适配设计: zh-CN/development/云异环适配开发设计文档.md
+          - 云异环输入审计与实施清单: zh-CN/development/云异环输入审计报告与实施清单.md
 
 markdown_extensions:
   - admonition
