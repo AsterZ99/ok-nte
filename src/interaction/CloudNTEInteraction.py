@@ -249,20 +249,66 @@ class CloudNTEInteraction(NTEInteraction):
                 self._restore_cursor()
 
     def move(self, x, y, down_btn=0):
-        child = self.hwnd
         x, y = self._scale_to_child(x, y)
-
-        def dispatch():
-            self._leaf_post(win32con.WM_MOUSEMOVE, down_btn, x, y)
-            self.mouse_pos = (x, y)
-
-        def run():
-            # No restore: drag/swipe sequences need the cursor to stay at the
-            # moved position between steps; mouse_up releases it.
-            self._with_real_cursor(child, x, y, dispatch, restore=False)
-
-        self._dispatch_with_activation(run)
+        self._leaf_post(win32con.WM_MOUSEMOVE, down_btn, x, y)
+        self.mouse_pos = (x, y)
         return (int(y) & 0xFFFF) << 16 | (int(x) & 0xFFFF)
+
+    _BUTTON_FLAGS = {
+        "left": (0x0002, 0x0004),  # MOUSEEVENTF_LEFTDOWN / LEFTUP
+        "middle": (0x0020, 0x0040),  # MOUSEEVENTF_MIDDLEDOWN / MIDDLEUP
+        "right": (0x0008, 0x0010),  # MOUSEEVENTF_RIGHTDOWN / RIGHTUP
+    }
+
+    def _bring_cloud_to_front(self):
+        """Bring the cloud window to the foreground for a physical click.
+
+        Returns the previously active window hwnd, or None when no switch is
+        needed/possible.
+        """
+        main_hwnd = self.hwnd_window.hwnd
+        if not main_hwnd or not win32gui.IsWindow(main_hwnd):
+            return None
+        previous = win32gui.GetForegroundWindow()
+        if previous == main_hwnd:
+            return None
+        try:
+            win32gui.ShowWindow(main_hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(main_hwnd)
+        except Exception as error:
+            logger.warning(f"SetForegroundWindow failed: {error!r}")
+            return None
+        time.sleep(0.15)
+        if win32gui.GetForegroundWindow() != main_hwnd:
+            logger.warning("cloud window did not become the foreground window")
+            return None
+        return previous
+
+    def _restore_foreground(self, previous):
+        if previous and win32gui.IsWindow(previous):
+            try:
+                win32gui.SetForegroundWindow(previous)
+            except Exception as error:
+                logger.warning(f"restore foreground failed: {error!r}")
+
+    def _physical_button(self, child, x, y, down_flag, up_flag, down_time):
+        """Physical click: cursor teleport + real button events.
+
+        The cloud client forwards raw-input button events to the streamed
+        game; posted button messages never reach it. The cursor teleports to
+        the target and the click happens at OS level, so the game window must
+        be visible/uncovered at the target point.
+        """
+        screen = win32gui.ClientToScreen(child, (int(x), int(y)))
+        previous = self._bring_cloud_to_front()
+        try:
+            win32api.SetCursorPos(screen)
+            time.sleep(self.CURSOR_SETTLE_SECONDS)
+            win32api.mouse_event(down_flag, 0, 0, 0, 0)
+            time.sleep(down_time)
+            win32api.mouse_event(up_flag, 0, 0, 0, 0)
+        finally:
+            self._restore_foreground(previous)
 
     def click(self, x=-1, y=-1, move_back=False, name=None, down_time=0.01, move=True, key="left"):
         with self._input_lock:
@@ -273,43 +319,12 @@ class CloudNTEInteraction(NTEInteraction):
             x, y = self._scale_to_child(x, y)
             # Streaming latency needs a more deliberate press than local play.
             down_time = max(float(down_time), self.MIN_CLICK_DOWN_TIME)
-            if key == "left":
-                btn_down, btn_mk, btn_up = (
-                    win32con.WM_LBUTTONDOWN,
-                    win32con.MK_LBUTTON,
-                    win32con.WM_LBUTTONUP,
-                )
-            elif key == "middle":
-                btn_down, btn_mk, btn_up = (
-                    win32con.WM_MBUTTONDOWN,
-                    win32con.MK_MBUTTON,
-                    win32con.WM_MBUTTONUP,
-                )
-            else:
-                btn_down, btn_mk, btn_up = (
-                    win32con.WM_RBUTTONDOWN,
-                    win32con.MK_RBUTTON,
-                    win32con.WM_RBUTTONUP,
-                )
+            down_flag, up_flag = self._BUTTON_FLAGS.get(key, self._BUTTON_FLAGS["left"])
 
             def dispatch():
-                if move:
-                    # The cloud server tracks the real cursor with latency:
-                    # post the move, wait for the position to propagate, then
-                    # click. Restoring the real cursor afterwards would drag
-                    # the server cursor off the target, so it is intentionally
-                    # not done here (restored on task exit).
-                    self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
-                    time.sleep(self.CURSOR_SETTLE_SECONDS)
-                    self._leaf_post(win32con.WM_MOUSEMOVE, 0, x, y)
-                self._leaf_post(btn_down, btn_mk, x, y)
-                time.sleep(down_time)
-                self._leaf_post(btn_up, 0, x, y)
+                self._physical_button(child, x, y, down_flag, up_flag, down_time)
 
-            def run():
-                self._with_real_cursor(child, x, y, dispatch)
-
-            self._dispatch_with_activation(run)
+            self._dispatch_with_activation(dispatch)
 
     def right_click(self, x=-1, y=-1, move_back=False, name=None):
         self.click(x, y, move_back=move_back, name=name, key="right")
@@ -321,58 +336,47 @@ class CloudNTEInteraction(NTEInteraction):
                 x, y = round(self.capture.width * 0.5), round(self.capture.height * 0.5)
             child = self.hwnd
             x, y = self._scale_to_child(x, y)
-            btn_mk = {"left": win32con.MK_LBUTTON, "middle": win32con.MK_MBUTTON}.get(
-                key, win32con.MK_RBUTTON
-            )
-            action = {"left": win32con.WM_LBUTTONDOWN, "middle": win32con.WM_MBUTTONDOWN}.get(
-                key, win32con.WM_RBUTTONDOWN
+            down_flag, _up_flag = self._BUTTON_FLAGS.get(
+                key, self._BUTTON_FLAGS["left"]
             )
 
             def dispatch():
-                self._leaf_post(action, btn_mk, x, y)
+                screen = win32gui.ClientToScreen(child, (int(x), int(y)))
+                self._bring_cloud_to_front()
+                win32api.SetCursorPos(screen)
+                time.sleep(self.CURSOR_SETTLE_SECONDS)
+                win32api.mouse_event(down_flag, 0, 0, 0, 0)
                 self.mouse_pos = (x, y)
 
-            def run():
-                # Held press: the cursor stays at the target until mouse_up.
-                self._with_real_cursor(child, x, y, dispatch, restore=False)
-
-            self._dispatch_with_activation(run)
+            self._dispatch_with_activation(dispatch)
 
     def mouse_up(self, key="left"):
         with self._input_lock:
-            action = {"left": win32con.WM_LBUTTONUP, "middle": win32con.WM_MBUTTONUP}.get(
-                key, win32con.WM_RBUTTONUP
-            )
-            x, y = self._scale_to_child(*getattr(self, "mouse_pos", (0, 0)))
-            self._leaf_post(action, 0, x, y)
-            self._restore_cursor_later()
-            if self.DEACTIVATE_AFTER_DISPATCH:
-                # Queued after the button-up message.
-                self.release_fake_activation(post=True)
+            _down_flag, up_flag = self._BUTTON_FLAGS.get(key, self._BUTTON_FLAGS["left"])
+            win32api.mouse_event(up_flag, 0, 0, 0, 0)
 
     def scroll(self, x, y, scroll_amount):
         # Live-client status: background wheel is unconfirmed; the prior art
-        # falls back to physical scrolling. We still post the message.
+        # falls back to physical scrolling. Physical wheel at the cursor.
         with self._input_lock:
             self.try_activate()
             child = self.hwnd
-            wparam = win32api.MAKELONG(0, win32con.WHEEL_DELTA * scroll_amount)
+            x, y = self._scale_to_child(x, y)
 
-            def run():
-                if x > 0 and y > 0:
-                    scaled_x, scaled_y = self._scale_to_child(x, y)
-                    self._with_real_cursor(
-                        child,
-                        scaled_x,
-                        scaled_y,
-                        lambda: self._leaf_post(
-                            win32con.WM_MOUSEWHEEL, wparam, scaled_x, scaled_y
-                        ),
-                    )
-                else:
-                    self._leaf_post(win32con.WM_MOUSEWHEEL, wparam, 0, 0)
+            def dispatch():
+                screen = win32gui.ClientToScreen(child, (int(x), int(y)))
+                previous = self._bring_cloud_to_front()
+                try:
+                    win32api.SetCursorPos(screen)
+                    time.sleep(self.CURSOR_SETTLE_SECONDS)
+                    delta = win32con.WHEEL_DELTA if scroll_amount > 0 else -win32con.WHEEL_DELTA
+                    for _ in range(abs(scroll_amount)):
+                        win32api.mouse_event(0x0800, 0, 0, delta, 0)  # MOUSEEVENTF_WHEEL
+                        time.sleep(0.05)
+                finally:
+                    self._restore_foreground(previous)
 
-            self._dispatch_with_activation(run)
+            self._dispatch_with_activation(dispatch)
 
     def move_mouse_relative(self, dx, dy):
         # Camera rotation does not reach the streamed game via injected or
