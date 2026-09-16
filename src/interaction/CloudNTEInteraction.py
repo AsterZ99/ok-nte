@@ -72,13 +72,15 @@ class CloudNTEInteraction(NTEInteraction):
     #: activate+deactivate strategy was the actual cause of "click position is
     #: right but nothing happens".
     LEASE_REFRESH_SECONDS = 0.3
-    #: release the lease after this much idle time with no dispatch. While the
-    #: lease is held the client captures the real mouse (its documented
-    #: behavior), so the lease must not outlive the input burst.
-    LEASE_IDLE_SECONDS = 3.0
+    #: release the lease after this much idle time with no dispatch. Kept wide
+    #: enough to survive typical task gaps between clicks (a cold re-warm is
+    #: unproven at very short lead times). While the lease is held the client
+    #: captures the real mouse (its documented behavior), so the lease must not
+    #: outlive the input burst — do not move the real mouse during a task.
+    LEASE_IDLE_SECONDS = 10.0
     #: cold lease: assert activation and let the client open its forwarding
     #: gate before the first button event of the burst.
-    LEASE_WARMUP_SECONDS = 0.3
+    LEASE_WARMUP_SECONDS = 0.5
     MIN_CLICK_DOWN_TIME = 0.08
     #: gap between the posted MOVE and the button DOWN. Live-client matrix: the
     #: DOWN must arrive within ~0.15s of the activation to be forwarded, so this
