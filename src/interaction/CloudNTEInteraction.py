@@ -307,6 +307,10 @@ class CloudNTEInteraction(NTEInteraction):
             win32api.mouse_event(down_flag, 0, 0, 0, 0)
             time.sleep(down_time)
             win32api.mouse_event(up_flag, 0, 0, 0, 0)
+            # Give the client time to process the button-up before switching
+            # the foreground away, otherwise the release can be dropped by
+            # its activity gate (press without release).
+            time.sleep(0.25)
         finally:
             self._restore_foreground(previous)
 
