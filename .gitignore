@@ -81,3 +81,6 @@ mid_lib/*
 
 # WorkBuddy agent workspace (local only)
 .workbuddy/
+
+# test-generated samples (audit A-14)
+tests/.tmp/
