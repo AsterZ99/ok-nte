@@ -961,6 +961,29 @@ class BaseNTETask(
 
         return "zh" in self.get_app_locale()
 
+    @property
+    def frame(self):
+        """Read the frame and piggyback one capture-health observation (A-06).
+
+        The cloud input gate rejects dispatches whose last health observation
+        is older than ``FRAME_MAX_AGE_SECONDS``. Observing only once at task
+        start (``NTEOneTimeTask.run``) makes every task longer than the window
+        fail closed on ``stale_frame`` — the live symptom is "click position is
+        right but nothing happens", because no message is ever sent.
+
+        Tasks read ``self.frame`` on every screen-driven loop iteration, so
+        hooking this property keeps the observation continuously fresh at zero
+        extra capture cost (``update_capture_health`` throttles itself and
+        returns immediately for non-cloud run targets, so local play is
+        unaffected).
+        """
+        value = super().frame
+        try:
+            self.update_capture_health(frame=value)
+        except Exception as error:  # a health probe must never break the task
+            self.log_warning(f"capture health observation failed: {error!r}")
+        return value
+
     def update_capture_health(self, frame=None, throttle_seconds=5.0):
         """周期性截图健康检查 (Phase 4 / audit A-06): 失败时置 game_capture_ready=False。
 

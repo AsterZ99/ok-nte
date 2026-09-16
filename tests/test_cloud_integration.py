@@ -303,6 +303,88 @@ class TestCaptureHealth(_LauncherTaskBase):
         )
 
 
+class TestFrameObservationHook(_LauncherTaskBase):
+    """The frame property must refresh the cloud health observation (A-06).
+
+    Live failure (2026-09-16): the observation was pushed only once at task
+    start, so every task longer than the staleness window had all input
+    rejected as ``stale_frame`` while the click coordinates were correct.
+    """
+
+    # reuse the fixtures without re-running the parent class's test methods
+    _make_health_task = TestCaptureHealth._make_health_task
+    _patch_og = TestCaptureHealth._patch_og
+
+    def _make_frame_task(self, frame):
+        task = self._make_health_task(frame)
+        task._executor = Mock()
+        task._executor.frame = frame
+        return task
+
+    def test_frame_property_pushes_cloud_observation(self):
+        frame = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+        task = self._make_frame_task(frame)
+        interaction = Mock()
+        og_patch, iswindow_patch = self._patch_og(interaction=interaction)
+
+        with og_patch, iswindow_patch:
+            returned = task.frame
+
+        self.assertIs(returned, frame)
+        interaction.record_frame_health.assert_called_once_with(
+            CloudFrameHealth.OK, (1920, 1080)
+        )
+
+    def test_frame_property_passes_frame_without_rereading(self):
+        """The hook must pass the frame down, not re-enter self.frame."""
+        frame = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+        task = self._make_frame_task(frame)
+        task.update_capture_health = Mock(return_value=CloudFrameHealth.OK)
+
+        returned = task.frame
+
+        self.assertIs(returned, frame)
+        task.update_capture_health.assert_called_once_with(frame=frame)
+
+    def test_frame_property_skips_local_target(self):
+        frame = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+        task = self._make_frame_task(frame)
+        interaction = Mock()
+        og_patch, iswindow_patch = self._patch_og(
+            selected_exe="HTGame.exe", interaction=interaction
+        )
+
+        with og_patch, iswindow_patch:
+            returned = task.frame
+
+        # local play must keep its exact previous behavior (audit A-06)
+        self.assertIs(returned, frame)
+        interaction.record_frame_health.assert_not_called()
+        task.scene.set_game_capture_ready.assert_not_called()
+
+    def test_frame_property_survives_health_failure(self):
+        frame = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+        task = self._make_frame_task(frame)
+        task.update_capture_health = Mock(side_effect=RuntimeError("probe exploded"))
+
+        self.assertIs(task.frame, frame)
+        task.log_warning.assert_called_once()
+
+    def test_repeated_frame_reads_stay_throttled(self):
+        frame = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+        task = self._make_frame_task(frame)
+        interaction = Mock()
+        og_patch, iswindow_patch = self._patch_og(interaction=interaction)
+
+        with og_patch, iswindow_patch:
+            for _ in range(5):
+                task.frame
+
+        # 5s throttle: five immediate reads produce exactly one observation
+        interaction.record_frame_health.assert_called_once()
+        task.scene.set_game_capture_ready.assert_called_once_with(True)
+
+
 class TestOneTimeTaskHealthGate(unittest.TestCase):
     def test_one_time_task_runs_health_check_before_ready_gate(self):
         from src.tasks.NTEOneTimeTask import NTEOneTimeTask
